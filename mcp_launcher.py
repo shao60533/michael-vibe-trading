@@ -124,6 +124,11 @@ LARK_APP_ID = os.environ.get("LARK_APP_ID", "").strip()
 LARK_APP_SECRET = os.environ.get("LARK_APP_SECRET", "").strip()
 FEISHU_VERIFICATION_TOKEN = os.environ.get("FEISHU_VERIFICATION_TOKEN", "").strip()
 FEISHU_DEFAULT_PRESET = os.environ.get("FEISHU_DEFAULT_PRESET", "investment_committee").strip()
+# Link-share permission for every docx the bot creates. Default tenant_readable
+# so group members can open the link without applying for permission.
+# Valid: tenant_readable / tenant_editable / anyone_readable / anyone_editable / closed
+FEISHU_DOC_SHARE_ENTITY = os.environ.get("FEISHU_DOC_SHARE_ENTITY",
+                                         "tenant_readable").strip().lower()
 FEISHU_ENABLED = bool(LARK_APP_ID and LARK_APP_SECRET)
 
 # Notion integration (optional). Set EITHER:
@@ -2226,6 +2231,43 @@ def _feishu_insert_blocks(doc_id: str, blocks: list[dict]) -> bool:
     return True
 
 
+def _feishu_set_doc_link_share(doc_id: str, entity: str = "tenant_readable") -> bool:
+    """Set link-share permission on a docx so anyone in the org with the link
+    can read it without applying for permission.
+
+    Requires `drive:drive` (or `docs:doc`) app scope. Falls back silently if
+    the app version hasn't been published with the required scope active.
+
+    `entity` values:
+      - `tenant_readable` 组织内可阅读 (推荐 — 群成员直接看)
+      - `tenant_editable` 组织内可编辑
+      - `anyone_readable` 公网可阅读 (慎用,内容会被搜索引擎收录)
+      - `closed`          关闭分享 (默认 Feishu 行为)
+    """
+    if not doc_id or entity == "closed":
+        return False
+    try:
+        token = _feishu_get_tenant_token()
+        with httpx.Client(timeout=15) as c:
+            r = c.patch(
+                f"https://open.feishu.cn/open-apis/drive/v1/permissions/{doc_id}/public"
+                f"?type=docx",
+                headers={"Authorization": f"Bearer {token}",
+                         "Content-Type": "application/json"},
+                json={"link_share_entity": entity},
+            )
+            d = r.json()
+        if d.get("code") != 0:
+            print(f"[feishu/docx] set link-share=({entity}) failed: "
+                  f"{d.get('code')} {d.get('msg','')[:120]}", flush=True)
+            return False
+        return True
+    except Exception as e:
+        print(f"[feishu/docx] set link-share exception: "
+              f"{type(e).__name__}: {e}", flush=True)
+        return False
+
+
 def _feishu_share_doc_with_user(doc_id: str, open_id: str, perm: str = "full_access") -> bool:
     """Add a user as a member on a docx. Requires `drive:drive` (or
     `docs:permission.member:create`) app permission. Failure is non-fatal —
@@ -2339,8 +2381,14 @@ def _feishu_create_doc_from_report(summary: dict, full_report: str,
     blocks = blocks[:99]
 
     ok = _feishu_insert_blocks(doc_id, blocks)
-    if ok and share_with_open_id:
-        _feishu_share_doc_with_user(doc_id, share_with_open_id, perm="full_access")
+    if ok:
+        # Default: anyone in the org with the link can read (so group members
+        # don't need to apply for permission). Falls back silently if the
+        # required scope isn't activated.
+        if FEISHU_DOC_SHARE_ENTITY != "closed":
+            _feishu_set_doc_link_share(doc_id, entity=FEISHU_DOC_SHARE_ENTITY)
+        if share_with_open_id:
+            _feishu_share_doc_with_user(doc_id, share_with_open_id, perm="full_access")
     return url if ok else None
 
 
