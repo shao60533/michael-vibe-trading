@@ -1101,6 +1101,31 @@ def _load_feishu_meta(run_id: str) -> dict | None:
         return None
 
 
+# "Already published" marker — written once the poll loop has pushed a terminal
+# run's result. Prevents re-publishing the same report on every container
+# restart (push-to-deploy means restarts are frequent). _restore checks this so
+# only genuinely-unpublished terminal runs (finished while we were down) and
+# still-running runs get re-queued.
+def _feishu_published_path(run_id: str):
+    import pathlib
+    return (pathlib.Path(mcp_server.__file__).resolve().parent /
+            ".swarm" / "runs" / run_id / "feishu_published.json")
+
+
+def _mark_feishu_published(run_id: str) -> None:
+    p = _feishu_published_path(run_id)
+    if not p.parent.exists():
+        return
+    try:
+        p.write_text(json.dumps({"published_at": time.time()}), encoding="utf-8")
+    except Exception as e:
+        print(f"[feishu] mark published {run_id} err: {e}", flush=True)
+
+
+def _is_feishu_published(run_id: str) -> bool:
+    return _feishu_published_path(run_id).exists()
+
+
 def _restore_feishu_pending_from_disk() -> int:
     """Scan disk for running swarm runs that have feishu_meta, restore them to
     the in-memory pending dict. Called once at startup."""
@@ -1125,11 +1150,18 @@ def _restore_feishu_pending_from_disk() -> int:
             continue
         if run is None:
             continue
-        # Restore both running and recently-terminal runs that haven't been
-        # published yet (i.e., still on disk → we may need to push their result).
-        # The poll loop will then drain terminal ones.
-        if run.status in (RunStatus.running, RunStatus.completed,
-                          RunStatus.failed, RunStatus.cancelled):
+        # Re-queue running runs unconditionally; re-queue terminal runs ONLY if
+        # they were never published (i.e., finished while the container was
+        # down). Already-published terminal runs are skipped so a restart
+        # doesn't re-push every historical report.
+        if run.status == RunStatus.running:
+            should_restore = True
+        elif run.status in (RunStatus.completed, RunStatus.failed,
+                            RunStatus.cancelled):
+            should_restore = not _is_feishu_published(rid)
+        else:
+            should_restore = False
+        if should_restore:
             with _feishu_pending_lock:
                 if rid not in _feishu_pending:
                     _feishu_pending[rid] = meta
@@ -2664,6 +2696,10 @@ def _feishu_poll_loop():
                             loop.run_until_complete(_publish_terminal_run(run, info))
                         except Exception as e:
                             print(f"[feishu] publish err {run_id}: {e}", flush=True)
+                        finally:
+                            # Mark published regardless of outcome (best-effort
+                            # semantics) so a restart never re-pushes this run.
+                            _mark_feishu_published(run_id)
                         with _feishu_pending_lock:
                             _feishu_pending.pop(run_id, None)
                 time.sleep(15)
@@ -2672,6 +2708,21 @@ def _feishu_poll_loop():
                 time.sleep(30)
     finally:
         loop.close()
+
+
+def _spawn_feishu_handler(body: dict) -> None:
+    """Run the inbound message handler in its own thread with a private event
+    loop. The handler makes blocking sync httpx calls (tenant token, send_text)
+    and starts swarm runs; running it on the server's event loop would freeze
+    every concurrent request (SSE streams, other webhooks, /healthz) for the
+    duration. A short-lived thread per message keeps those off the hot loop.
+    Message volume is low (chat bot) and event_id dedup runs before this."""
+    def _runner():
+        try:
+            asyncio.run(_feishu_handle_message(body))
+        except Exception as e:
+            print(f"[feishu] handler thread error: {e}", file=sys.stderr, flush=True)
+    threading.Thread(target=_runner, daemon=True, name="feishu-msg").start()
 
 
 # Webhook
@@ -2708,8 +2759,9 @@ async def feishu_events(request: Request):
             return JSONResponse({"code": 0})
         event_type = header.get("event_type", "")
         if event_type == "im.message.receive_v1":
-            asyncio.create_task(_feishu_handle_message(body))
-        # Always 200 quickly so Feishu doesn't retry. Real work happens async.
+            _spawn_feishu_handler(body)
+        # Always 200 quickly so Feishu doesn't retry. Real work happens in a
+        # background thread so the event loop is never blocked.
         return JSONResponse({"code": 0})
 
     return JSONResponse({"code": 0})
