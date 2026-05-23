@@ -1845,7 +1845,9 @@ async def _summarize_report(run) -> dict | None:
                             {"role": "user", "content": user_msg},
                         ],
                         "response_format": {"type": "json_object"},
-                        "max_tokens": 4000,
+                        # DeepSeek-v4-pro 是 reasoning model,推理本身吃 token,
+                        # 6000 给输出 JSON 留够空间避免截断
+                        "max_tokens": 6000,
                         # Slightly bump temperature on retries to break determinism.
                         "temperature": 0.1 + 0.1 * (attempt - 1),
                     },
@@ -1855,15 +1857,25 @@ async def _summarize_report(run) -> dict | None:
                     print(f"[summarizer] attempt {attempt} {last_err}", flush=True)
                     continue
                 d = r.json()
-                msg = d["choices"][0]["message"]
-                content = msg.get("content") or msg.get("reasoning_content") or ""
+                choice = d["choices"][0]
+                msg = choice.get("message") or {}
+                finish_reason = choice.get("finish_reason") or ""
+                # 只取 content;reasoning_content 是 chain-of-thought,不是 JSON
+                content = (msg.get("content") or "").strip()
+                if finish_reason == "length":
+                    # 截断了,JSON 一定不完整,不浪费 parse 重试
+                    last_err = f"truncated (finish_reason=length, content_len={len(content)})"
+                    print(f"[summarizer] attempt {attempt}: {last_err}", flush=True)
+                    continue
                 if not content:
-                    last_err = "empty content+reasoning"
+                    # content 真空 — 落 reasoning_content 给运维看(不 parse)
+                    reasoning_len = len(msg.get("reasoning_content") or "")
+                    last_err = f"empty content (reasoning_len={reasoning_len}, finish={finish_reason})"
                     print(f"[summarizer] attempt {attempt}: {last_err}", flush=True)
                     continue
                 m = re.search(r"\{[\s\S]*\}", content)
                 if not m:
-                    last_err = "no JSON object found in response"
+                    last_err = f"no JSON object found (content[:120]={content[:120]!r})"
                     print(f"[summarizer] attempt {attempt}: {last_err}", flush=True)
                     continue
                 try:
@@ -1872,7 +1884,7 @@ async def _summarize_report(run) -> dict | None:
                     parsed.setdefault("template", template)
                     return parsed
                 except json.JSONDecodeError as je:
-                    last_err = f"JSONDecodeError: {je}"
+                    last_err = f"JSONDecodeError: {je} (content_len={len(content)}, finish={finish_reason})"
                     print(f"[summarizer] attempt {attempt}: {last_err}", flush=True)
                     continue
         except Exception as e:
