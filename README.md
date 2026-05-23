@@ -83,6 +83,34 @@ railway logs --service vibe-trading-mcp --build   # build 日志
 └── .github/workflows/ci.yml # PR + push 时跑 Python 语法检查
 ```
 
+## 上游引擎 (vibe-trading-ai)
+
+**真正干活的 swarm / agent / 回测代码不在本 repo 里**，作为 pip 包 `vibe-trading-ai==0.1.6` 装进容器(在 Dockerfile 里锁版本)。本 repo 只是部署 wrapper(Dockerfile + 入口 launcher + 自定义 skill + 飞书 / Notion 集成)。
+
+容器内上游引擎的位置 `/usr/local/lib/python3.11/site-packages/`：
+
+| 路径 | 内容 |
+|------|------|
+| `mcp_server.py` | FastMCP server，定义 `start_swarm_async` / `list_skills` 等 MCP tool |
+| `src/agent/loop.py` | agent 推理循环 |
+| `src/swarm/` | SwarmRuntime / SwarmStore / RunStatus 状态机 |
+| `src/core/runner.py` | 任务执行 |
+| `src/providers/llm.py` | LLM provider 抽象 (DeepSeek / OpenAI / OpenRouter) |
+| `src/skills/` | 内置 skill (yfinance / akshare / ...) — 我们的 `a-stock-data` / `global-stock-data` / `xiao-eyu` 也被装进同一目录 |
+| `backtest/` | 回测引擎 (options / 期货 / 标准回测) |
+
+**想看源码**：
+
+```bash
+# 本地拉 wheel 看代码
+pip download --no-deps vibe-trading-ai==0.1.6 -d /tmp/vibe && \
+  unzip /tmp/vibe/vibe_trading_ai-0.1.6-py3-none-any.whl -d /tmp/vibe/src
+```
+
+**想升级版本**：改 `Dockerfile` 里 `vibe-trading-ai==X.Y.Z`，push 即生效。需要先在本地装新版跑过一次再推。
+
+**想魔改 swarm 内部**：当前不在 repo 范围；真要改时切换到 vendor 模式 (把 wheel 解压进 repo + Dockerfile 改 `pip install -e .`)，看 [CONTRIBUTING.md](CONTRIBUTING.md) 或讨论。
+
 ## 本地开发
 
 ```bash
