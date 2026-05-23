@@ -497,6 +497,100 @@ async def debug_env(_):
     return JSONResponse(out)
 
 
+async def debug_list_feishu_chats(_):
+    """List groups + p2p chats the bot is currently a member of, so an operator
+    can grab a `chat_id` for one-off republish operations."""
+    if not FEISHU_ENABLED:
+        return JSONResponse({"error": "feishu disabled"}, status_code=400)
+    try:
+        token = _feishu_get_tenant_token()
+    except Exception as e:
+        return JSONResponse({"error": f"tenant_access_token: {e}"}, status_code=500)
+    items: list[dict] = []
+    page_token = ""
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            for _i in range(5):  # cap 5 pages
+                params = {"page_size": 100}
+                if page_token:
+                    params["page_token"] = page_token
+                r = await c.get(
+                    "https://open.feishu.cn/open-apis/im/v1/chats",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params=params,
+                )
+                d = r.json()
+                if d.get("code") != 0:
+                    return JSONResponse({"error": d.get("msg"), "code": d.get("code")},
+                                        status_code=500)
+                items.extend(d.get("data", {}).get("items", []) or [])
+                page_token = d.get("data", {}).get("page_token") or ""
+                if not d.get("data", {}).get("has_more"):
+                    break
+    except Exception as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
+    out = [{"chat_id": it.get("chat_id"), "name": it.get("name"),
+            "chat_mode": it.get("chat_mode"), "tenant_key": it.get("tenant_key")}
+           for it in items]
+    return JSONResponse({"count": len(out), "chats": out})
+
+
+async def debug_republish(request):
+    """Trigger _publish_terminal_run for a finished run that wasn't auto-published
+    (e.g., run was started via MCP run_swarm tool with no Feishu chat context,
+    or the disk was wiped by a redeploy before publish could happen).
+
+    POST JSON body: {
+      run_id (required), chat_id (required),
+      final_report (required: raw markdown report text),
+      preset (default investment_committee),
+      target (optional),
+      chat_type (default chat_id),
+      gurus_override (optional list of guru skill names)
+    }
+
+    Builds a synthetic Run object so we don't depend on disk state being intact.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "POST JSON body required"}, status_code=400)
+    run_id = (body.get("run_id") or "").strip()
+    chat_id = (body.get("chat_id") or "").strip()
+    final_report = body.get("final_report") or ""
+    preset = (body.get("preset") or "investment_committee").strip()
+    target = (body.get("target") or "").strip()
+    chat_type = (body.get("chat_type") or "chat_id").strip() or "chat_id"
+    gurus_override = body.get("gurus_override") or []
+    if not run_id or not chat_id or not final_report:
+        return JSONResponse(
+            {"error": "run_id, chat_id, final_report all required"},
+            status_code=400)
+
+    from types import SimpleNamespace
+    fake_run = SimpleNamespace(
+        id=run_id,
+        status=SimpleNamespace(value="completed"),
+        final_report=final_report,
+        preset_name=preset,
+        user_vars={"target": target} if target else {},
+        total_input_tokens=0,
+        total_output_tokens=0,
+        tasks=[],
+    )
+    info = {"receive_id": chat_id, "receive_id_type": chat_type,
+            "sender_open_id": "", "chat_type": "", "target": target,
+            "preset": preset,
+            "gurus_override": [g for g in gurus_override
+                                if g in _GURU_SKILLS][:GURU_VIEW_MAX]}
+    try:
+        await _publish_terminal_run(fake_run, info)
+    except Exception as e:
+        return JSONResponse({"error": f"publish: {type(e).__name__}: {e}"},
+                            status_code=500)
+    return JSONResponse({"ok": True, "run_id": run_id, "chat_id": chat_id})
+
+
 async def debug_purge_run(request):
     import ctypes, pathlib, shutil
     run_id = request.query_params.get("run_id", "").strip()
@@ -3272,6 +3366,8 @@ app = Starlette(
         Route("/_debug/swarm-state", debug_swarm_state),
         Route("/_debug/purge-run", debug_purge_run),
         Route("/_debug/env", debug_env),
+        Route("/_debug/list-feishu-chats", debug_list_feishu_chats),
+        Route("/_debug/republish", debug_republish, methods=["POST"]),
         Mount("/", app=mcp_app),
     ],
     middleware=[Middleware(AuthMiddleware)],
