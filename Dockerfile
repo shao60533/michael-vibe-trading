@@ -43,7 +43,9 @@ RUN useradd --create-home --shell /usr/sbin/nologin vibe \
     && echo "SkillsLoader.skills_dir = $SKILLS_DIR" \
     && mkdir -p "$SKILLS_DIR" \
     && cp -r /tmp/extra_skills/* "$SKILLS_DIR/" \
-    && ls -la "$SKILLS_DIR/a-stock-data/SKILL.md" "$SKILLS_DIR/xiao-eyu/SKILL.md" \
+    && ls -la "$SKILLS_DIR/a-stock-data/SKILL.md" \
+              "$SKILLS_DIR/global-stock-data/SKILL.md" \
+              "$SKILLS_DIR/xiao-eyu/SKILL.md" \
     && chown -R vibe:vibe /app
 USER vibe
 

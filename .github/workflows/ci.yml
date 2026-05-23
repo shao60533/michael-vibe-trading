@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  syntax-check:
+    name: Python syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile mcp_launcher.py
+        run: python -m py_compile mcp_launcher.py
+      - name: Verify Dockerfile has all skill dirs declared
+        run: |
+          # Ensure every skills/<name>/ has a corresponding SKILL.md sanity check
+          # in the Dockerfile so build catches missing files early.
+          for skill in skills/*/; do
+            name=$(basename "$skill")
+            if [ ! -f "${skill}SKILL.md" ]; then
+              echo "::error::skills/$name/ has no SKILL.md"
+              exit 1
+            fi
+            if ! grep -q "$name/SKILL.md" Dockerfile; then
+              echo "::warning::skills/$name not referenced in Dockerfile sanity ls"
+            fi
+          done
+      - name: Verify required env vars documented
+        run: |
+          # Anything mcp_launcher.py reads via os.environ should appear in .env.example
+          missing=0
+          for var in $(grep -oE 'os\.environ\.get\("[A-Z_]+"|os\.getenv\("[A-Z_]+"' mcp_launcher.py \
+                       | grep -oE '"[A-Z_]+"' | sort -u | tr -d '"'); do
+            if ! grep -q "^${var}=" .env.example; then
+              echo "::error::env var $var used in code but missing from .env.example"
+              missing=1
+            fi
+          done
+          exit $missing
