@@ -1463,7 +1463,8 @@ def _build_summarizer_prompt(template: str) -> str:
   "badge": "<按下面模板说明挑一个>",
   "badge_color": "green|red|blue|grey|orange",
   "headline": "1-2 句最核心结论(15-40 字)",
-  "tldr": "200-350 字的中文综述,流畅自然",
+  "tldr": "200-350 字的中文综述,流畅自然 — 用于飞书 docx 和 Notion 等长内容",
+  "short_tldr": "80-120 字的精炼综述 — 用于飞书互动卡片(必须比 tldr 更紧凑,只留最核心的判断和理由)",
   "kv_fields": [{{"label":"...","value":"..."}}, ...],
   "sections": [{{"label":"...","items":["...", "..."]}}, ...],
   "key_metrics": {{"指标名":"值", ...}},
@@ -1653,8 +1654,12 @@ async def _route_gurus(summary: dict, full_report: str, run_id: str) -> list[str
 
 
 async def _generate_single_guru_view(guru: str, full_report: str, summary: dict,
-                                      run_id: str) -> str | None:
-    """Generate one guru's view using their full SKILL.md as voice."""
+                                      run_id: str) -> dict | None:
+    """Generate one guru's view as a JSON object with takeaway + full_view.
+
+    Returns {"takeaway": "30-60 字一句话", "full_view": "180-400 字完整锐评"}
+    or None on failure / 不适用. Card uses takeaway, docx/Notion use full_view.
+    """
     skill_text = _GURU_SKILLS.get(guru)
     if not skill_text:
         return None
@@ -1668,14 +1673,18 @@ async def _generate_single_guru_view(guru: str, full_report: str, summary: dict,
         skill_text.strip()
         + "\n\n----\n"
         + f"你现在是 A 股游资『{display_name}』本人(派别: {school})。"
-        + "读下面这份个股分析报告，严格按你的判断框架给 3-5 句锐评。要点:\n"
-        + "1. 主线判断 / 个股定位 / 节奏阶段 / 操作建议 / 风险提示\n"
-        + "2. 操作建议要符合你这派的特色 (模式派→首板战法，控回撤派→4 点底线，进攻派→敢上重仓，等)\n\n"
+        + "读下面这份个股分析报告，严格按你的判断框架给观点。\n\n"
+        + "**必须返回严格 JSON,不要 markdown 围栏,不要解释:**\n"
+        + '{\n'
+        + '  "takeaway": "30-60 字一句话核心观点 — 直接说该买/该卖/该等 + 最关键的一个理由,口语化",\n'
+        + '  "full_view": "180-400 字完整锐评(3-5 行短句),覆盖主线判断 / 个股定位 / 节奏阶段 / 操作建议 / 风险提示"\n'
+        + '}\n\n'
         + "硬规则:\n"
-        + "- 全中文，口语化游资风格 (直接、不绕)\n"
-        + "- 不复述报告原文，只给『你会怎么看』\n"
-        + "- 不要 markdown 列表或 JSON，直接输出 3-5 行短句\n"
-        + "- 总长度 180-400 字"
+        + "- 全中文,口语化游资风格 (直接、不绕)\n"
+        + "- 操作建议要符合你这派的特色 (模式派→首板战法,控回撤派→4 点底线,进攻派→敢上重仓,等)\n"
+        + "- 不复述报告原文,只给『你会怎么看』\n"
+        + "- takeaway 是给一眼看的;full_view 才完整展开\n"
+        + "- 不适用时返回 null"
     )
     headline = summary.get("headline") or summary.get("title") or ""
     badge = summary.get("badge") or ""
@@ -1697,7 +1706,8 @@ async def _generate_single_guru_view(guru: str, full_report: str, summary: dict,
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_msg},
                     ],
-                    "max_tokens": 1200,
+                    "response_format": {"type": "json_object"},
+                    "max_tokens": 1500,
                     "temperature": 0.4,
                 },
             )
@@ -1707,10 +1717,23 @@ async def _generate_single_guru_view(guru: str, full_report: str, summary: dict,
                 return None
             d = r.json()
             msg = d["choices"][0]["message"]
-            text = (msg.get("content") or msg.get("reasoning_content") or "").strip()
-            if not text or text.startswith("不适用"):
+            content = (msg.get("content") or msg.get("reasoning_content") or "").strip()
+            if not content or content.lower() == "null":
                 return None
-            return text
+            m = re.search(r"\{[\s\S]*\}", content)
+            if not m:
+                # Fallback: treat raw text as full_view, copy first 60 chars as takeaway
+                return {"takeaway": content[:60], "full_view": content}
+            try:
+                parsed = json.loads(m.group(0))
+            except json.JSONDecodeError:
+                return {"takeaway": content[:60], "full_view": content}
+            takeaway = (parsed.get("takeaway") or "").strip()
+            full_view = (parsed.get("full_view") or "").strip()
+            if not full_view and not takeaway:
+                return None
+            return {"takeaway": takeaway or full_view[:60],
+                    "full_view": full_view or takeaway}
     except Exception as e:
         print(f"[guru/{guru}] exception run={run_id}: {type(e).__name__}: {e}",
               flush=True)
@@ -1747,10 +1770,16 @@ async def _generate_youzi_views(full_report: str, summary: dict,
     )
     views: list[dict] = []
     for guru, view in zip(selected, results):
-        if isinstance(view, str) and view:
+        if isinstance(view, dict) and (view.get("full_view") or view.get("takeaway")):
             display, school = GURU_META.get(guru, (guru, "未知派别"))
-            views.append({"guru": guru, "display_name": display,
-                          "school": school, "text": view})
+            views.append({
+                "guru": guru,
+                "display_name": display,
+                "school": school,
+                "takeaway": view.get("takeaway") or "",
+                # `text` 字段保持向后兼容,docx/Notion 渲染会读它当 full_view
+                "text": view.get("full_view") or view.get("takeaway") or "",
+            })
     print(f"[guru] run={run_id} produced {len(views)} views: "
           f"{[v['guru'] for v in views]}", flush=True)
     return views
@@ -1901,17 +1930,23 @@ def _kv_block(title: str, kv: dict[str, str]) -> dict:
 def _build_feishu_card(summary: dict, run_id: str,
                        notion_url: str | None = None,
                        feishu_doc_url: str | None = None) -> dict:
-    """Render a structured summary dict into a Feishu Interactive Card.
+    """Render a concise interactive card. Details (full tldr / sections /
+    key_metrics / catalysts / full guru views) live in the docx and Notion.
 
-    Schema is template-agnostic — driven by `kv_fields`, `sections`,
-    `actions_or_catalysts` arrays so we don't hardcode per-template labels.
+    Card content:
+      - header (title + decision badge)
+      - 📌 headline (one line)
+      - 2-4 KV fields (decision / target / horizon / risk)
+      - short_tldr (80-120 字精炼综述)
+      - 🐊 每位游资一行 takeaway (30-60 字)
+      - action buttons (docx + Notion) + run_id note
     """
     title = summary.get("title") or "swarm 分析报告"
     badge = summary.get("badge") or "中性"
     color = (_BADGE_COLOR_MAP.get(summary.get("badge_color") or "")
              or _DECISION_DEFAULT_COLOR.get(badge, "blue"))
 
-    # Top kv fields (decision/price/horizon... or stance/timeframe... depending on template)
+    # KV fields — 紧凑展示决策维度。
     top_fields: list[dict] = []
     for kv in (summary.get("kv_fields") or []):
         if not isinstance(kv, dict):
@@ -1926,61 +1961,51 @@ def _build_feishu_card(summary: dict, run_id: str,
         })
 
     elements: list[dict] = []
-    headline = summary.get("headline") or summary.get("decision_summary")  # back-compat
+    headline = summary.get("headline") or summary.get("decision_summary")
     if headline:
         elements.append({
             "tag": "div",
             "text": {"tag": "lark_md", "content": f"📌 **{headline}**"},
         })
     if top_fields:
-        elements.append({"tag": "div", "fields": top_fields})
-    elements.append({"tag": "hr"})
+        elements.append({"tag": "div", "fields": top_fields[:4]})
 
-    tldr = summary.get("tldr")
-    if tldr:
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": f"**📝 综述**\n{tldr}"},
-        })
-        elements.append({"tag": "hr"})
-
-    # Three bullet sections — labels from the template (multi/macro/research differ)
-    for sec in (summary.get("sections") or [])[:3]:
-        if not isinstance(sec, dict):
-            continue
-        label = str(sec.get("label", "")).strip() or "·"
-        items = sec.get("items") or []
-        body = "\n".join(f"• {x}" for x in items[:6]) if items else "_(未提及)_"
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": f"**{label}**\n{body}"},
-        })
-
-    elements.append({"tag": "hr"})
-    metrics = summary.get("key_metrics") or {}
-    if isinstance(metrics, dict) and metrics:
-        elements.append(_kv_block("📊 关键指标", metrics))
-    aoc = summary.get("actions_or_catalysts") or {}
-    if isinstance(aoc, dict) and aoc.get("items"):
-        elements.append(_bullet_block(aoc.get("label", "📋 后续"),
-                                      aoc.get("items") or []))
-
-    # 游资观点 (multi-guru) — LLM 自选 1-2 位互补游资,仅 stock_decision preset.
-    views = summary.get("youzi_views") or []
-    if views:
+    # 精简综述 (短版,完整版在 docx)
+    short_tldr = (summary.get("short_tldr") or "").strip()
+    if not short_tldr:
+        # 回退:若 summarizer 还没出 short_tldr 字段(老 run),把 tldr 截前 140 字
+        full = (summary.get("tldr") or "").strip()
+        if full:
+            short_tldr = full[:140] + ("…" if len(full) > 140 else "")
+    if short_tldr:
         elements.append({"tag": "hr"})
         elements.append({
             "tag": "div",
             "text": {"tag": "lark_md",
-                     "content": f"**🐊 游资观点 · LLM 自选 {len(views)} 位**"},
+                     "content": f"**📝 综述**\n{short_tldr}"},
         })
+
+    # 游资速看 — 每位一行 takeaway (full_view 留给 docx/Notion)
+    views = summary.get("youzi_views") or []
+    if views:
+        elements.append({"tag": "hr"})
+        lines = ["**🐊 游资速看**"]
         for v in views:
-            if not isinstance(v, dict) or not v.get("text"):
+            if not isinstance(v, dict):
                 continue
+            name = v.get("display_name", "游资")
+            school = v.get("school", "")
+            takeaway = (v.get("takeaway") or "").strip()
+            if not takeaway:
+                # 老数据没 takeaway,从 text 截 60 字
+                takeaway = (v.get("text") or "").strip()[:60]
+            if not takeaway:
+                continue
+            lines.append(f"• **{name}**({school}): {takeaway}")
+        if len(lines) > 1:
             elements.append({
                 "tag": "div",
-                "text": {"tag": "lark_md",
-                         "content": f"**{v.get('display_name','游资')} · {v.get('school','')}**\n{v['text']}"},
+                "text": {"tag": "lark_md", "content": "\n".join(lines)},
             })
 
     # Footer: full-report links (Feishu doc + Notion) + run id
