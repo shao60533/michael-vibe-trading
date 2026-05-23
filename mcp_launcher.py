@@ -546,7 +546,8 @@ async def debug_env(_):
         if not v:
             out[k] = None
         elif "KEY" in k or "TOKEN" in k or "SECRET" in k:
-            out[k] = f"{v[:6]}...REDACTED (len={len(v)})"
+            # Never leak any plaintext bytes — presence + length only.
+            out[k] = f"set (len={len(v)})"
         else:
             out[k] = v
     out["_module_constants"] = {
@@ -2743,6 +2744,19 @@ async def _publish_terminal_run(run, info: dict) -> None:
             print(f"[publish] card-fail send err {run_id}: {e2}", flush=True)
 
 
+async def _publish_one(run_id: str, run, info: dict) -> None:
+    """Publish a single terminal run, then mark it published. Wrapped so a
+    failure in one run can't abort the others when gathered concurrently."""
+    try:
+        await _publish_terminal_run(run, info)
+    except Exception as e:
+        print(f"[feishu] publish err {run_id}: {e}", flush=True)
+    finally:
+        # Mark published regardless of outcome (best-effort semantics) so a
+        # restart never re-pushes this run.
+        _mark_feishu_published(run_id)
+
+
 def _feishu_poll_loop():
     """Background poller. Runs an asyncio loop in this thread so it can await
     the publish coroutine (which uses async httpx for DeepSeek + Notion)."""
@@ -2763,6 +2777,10 @@ def _feishu_poll_loop():
                 if not snapshot:
                     time.sleep(15)
                     continue
+                # Collect terminal runs, then publish them concurrently so one
+                # slow publish (summarizer retries + guru gen) doesn't stall the
+                # rest of this cycle.
+                terminal: list[tuple] = []
                 for run_id, info in snapshot.items():
                     try:
                         run = store.load_run(run_id)
@@ -2772,16 +2790,15 @@ def _feishu_poll_loop():
                     if run is None:
                         continue
                     if run.status in (RunStatus.completed, RunStatus.failed, RunStatus.cancelled):
-                        try:
-                            loop.run_until_complete(_publish_terminal_run(run, info))
-                        except Exception as e:
-                            print(f"[feishu] publish err {run_id}: {e}", flush=True)
-                        finally:
-                            # Mark published regardless of outcome (best-effort
-                            # semantics) so a restart never re-pushes this run.
-                            _mark_feishu_published(run_id)
-                        with _feishu_pending_lock:
-                            _feishu_pending.pop(run_id, None)
+                        terminal.append((run_id, run, info))
+
+                if terminal:
+                    loop.run_until_complete(asyncio.gather(
+                        *[_publish_one(rid, r, i) for rid, r, i in terminal]
+                    ))
+                    with _feishu_pending_lock:
+                        for rid, _r, _i in terminal:
+                            _feishu_pending.pop(rid, None)
                 time.sleep(15)
             except Exception as e:
                 print(f"[feishu] poll loop error: {e}", file=sys.stderr, flush=True)
@@ -2923,6 +2940,7 @@ def _build_preset_vars(preset: str, target: str | None, market: str | None,
 
 async def _feishu_handle_message(body: dict):
     """Parse an incoming message + dispatch action. Fire-and-forget."""
+    chat_id = None
     try:
         event = body.get("event") or {}
         msg = event.get("message") or {}
@@ -3031,6 +3049,13 @@ async def _feishu_handle_message(body: dict):
         import traceback
         traceback.print_exc()
         print(f"[feishu] message handler error: {e}", file=sys.stderr, flush=True)
+        # Don't leave the user hanging with no reply.
+        if chat_id:
+            try:
+                _feishu_send_text(chat_id, "chat_id",
+                                  "处理出错了,请稍后重试,或发 help 看用法。")
+            except Exception:
+                pass
 
 
 # Preset → 中文显示名(用于 ack 文案,内部仍用英文 key)
@@ -3194,9 +3219,11 @@ async def _feishu_handle_cancel_run(chat_id: str, run_id: str) -> None:
     with _feishu_pending_lock:
         _feishu_pending.pop(run_id, None)
 
-    # 4. Remove disk artifacts.
+    # 4. Remove disk artifacts — but never destroy a completed run's report.
     target_dir = swarm_dir / run_id
-    if target_dir.exists():
+    if run is not None and run.status.value == "completed":
+        actions.append("run 已完成,保留报告未删除(可用 status 重新拉取)")
+    elif target_dir.exists():
         try:
             shutil.rmtree(target_dir)
             actions.append("清理 disk artifacts")

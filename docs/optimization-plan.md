@@ -39,10 +39,10 @@
 | P1-4 | `asyncio.create_task` 未持引用,任务可能被 GC | 中 | 偶发 | 阶段一(随 P0-2 一并解决) | ✅ 已实现 |
 | P1-5 | 取消用 `PyThreadState_SetAsyncExc` 而非上游协作式 `cancel_run` | 中 | 用户取消 run | 阶段二 | ✅ 已实现 |
 | P1-6 | OAuth `redirect_uri` 未做注册绑定/校验 | 中 | 钓鱼场景 | 阶段二 | ✅ 已实现 |
-| P2-7 | 取消会无差别删除已完成 run 的报告 | 低 | 取消已完成 run | 阶段三 | 待办 |
-| P2-8 | `/_debug/env` 泄露密钥前 6 位 | 低 | 持 Bearer 访问 | 阶段三 | 待办 |
-| P2-9 | poll loop 串行发布,慢发布拖累其他 run | 低 | 高并发 | 阶段三 | 待办 |
-| P2-10 | 入站处理器顶层 except 仅打印,用户零反馈 | 低 | 处理异常 | 阶段三 | 待办 |
+| P2-7 | 取消会无差别删除已完成 run 的报告 | 低 | 取消已完成 run | 阶段三 | ✅ 已实现 |
+| P2-8 | `/_debug/env` 泄露密钥前 6 位 | 低 | 持 Bearer 访问 | 阶段三 | ✅ 已实现 |
+| P2-9 | poll loop 串行发布,慢发布拖累其他 run | 低 | 高并发 | 阶段三 | ✅ 已实现 |
+| P2-10 | 入站处理器顶层 except 仅打印,用户零反馈 | 低 | 处理异常 | 阶段三 | ✅ 已实现 |
 
 > P0-1 与 P0-2 会相互放大:P0-2 阻塞健康检查 → Railway 重启 → P0-1 重复推送。两者需在同一阶段一起修。
 
@@ -213,12 +213,12 @@ def _client_redirect_uris(client_id: str) -> list[str] | None:
 
 ---
 
-### P2 杂项(阶段三)
+### P2 杂项(阶段三,均已实现)
 
-- **P2-7 取消误删完成报告**(`:3062`):`_feishu_handle_cancel_run` 删 disk 前判断 run 终态;`completed` 的 run 拒绝删除报告,仅从 pending 移除并提示。
-- **P2-8 `/_debug/env` 泄露前 6 位**(`:489`):改为只返回 `True/False`(是否设置)+ 长度,不返回明文片段。
-- **P2-9 poll 串行发布**(`:2654`):慢发布会拖住其他 run。低优先;如需,可把单个 run 的 publish 提交到线程池并发执行,或限制 summarizer 重试上限。当前量级可暂不动。
-- **P2-10 顶层 except 静默**(`:2898`):`_feishu_handle_message` 兜底 except 里给原 chat 回一句"处理出错,请重试",避免用户零反馈。
+- **P2-7 取消误删完成报告**:`_feishu_handle_cancel_run` 删 disk 前判断 `run.status.value == "completed"`,完成态拒绝删除报告并提示"可用 status 重新拉取",其余照旧清理。
+- **P2-8 `/_debug/env` 泄露前 6 位**:密钥类改为只返回 `set (len=N)`,不返回任何明文片段。
+- **P2-9 poll 串行发布**:抽出 `_publish_one`,poll loop 先收集本轮所有终态 run,再用 `asyncio.gather` 并发发布,单个慢发布不再拖住其他 run;每个 run 各自 `finally` 落已发布标记。
+- **P2-10 顶层 except 静默**:`_feishu_handle_message` 把 `chat_id` 提到 try 外,兜底 except 里给原 chat 回一句"处理出错了,请稍后重试,或发 help",避免用户零反馈。
 
 ---
 
