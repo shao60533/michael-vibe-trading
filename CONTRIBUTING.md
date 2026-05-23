@@ -39,6 +39,10 @@ gh pr create --base main --fill         # 或在 GitHub 网页发 PR
 提 PR 前自查:
 
 - [ ] `python -m py_compile mcp_launcher.py` 通过(CI 会再跑一次)
+- [ ] 如果改了 LLM prompt 或 JSON schema(summarizer / guru route / guru voice / feishu intent router):
+  - [ ] 重算 `max_tokens` 预算(DeepSeek-v4-pro 是 reasoning model,推理本身吃 token,字段越多输出越紧)
+  - [ ] 本地用 `/_debug/republish` 配 `skip_feishu_card=true` 跑一次历史报告 smoke-test,确认 LLM 输出 JSON 解析正常,**不要直接 push 上线**
+  - [ ] 如果加了新 LLM 调用 site,优先用现有的 `_deepseek_json_call` helper(统一处理截断 / 空 content / 解析错误)
 - [ ] 没把密钥/token 写进代码或测试文件
 - [ ] 没把 `.env` 文件 commit 进去
 - [ ] 新增环境变量同步更新到 `.env.example`(CI 会自动校验)

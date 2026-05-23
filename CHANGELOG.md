@@ -19,6 +19,17 @@ cut 版本时把 `[Unreleased]` 整体移到一个带日期的版本号下，再
 
 ## [Unreleased]
 
+### Fixed
+
+- **LLM JSON 调用全面健壮化**:抽出共享 helper `_deepseek_json_call`,把 summarizer / guru route / guru voice 三个 site 统一收口。修复:
+  - `max_tokens` 全部上调留够 reasoning + output (summarizer 4000→6000,route 1500→3000,voice 1500→3000)
+  - 显式检测 `finish_reason==length` 短路 parse 重试(之前会浪费 3 次重试解析必然失败的截断 JSON)
+  - 不再 fallback 到 `reasoning_content`(那是 CoT 思维链不是 JSON,导致老 router 偶发 "no JSON in response" 假阳性)
+  - read timeout 60→90s(reasoning model 长输出经常 60s+)
+  - 错误日志带 `content_len` / `finish_reason` / content snippet 上下文,便于诊断
+- **silent partial degradation 显式化**:游资视图为空时 `_publish_terminal_run` 现在显式 log `[publish] guru views EMPTY ... 卡片将不带 游资速看`,避免静默漏环
+- **CONTRIBUTING PR checklist 加硬规则**:LLM prompt / JSON schema 改动必须重算 max_tokens + 本地 smoke-test (`/_debug/republish skip_feishu_card=true`),不准直接 push
+
 ### Added
 
 - **F 方案:docx 写入用户云盘文件夹**:新增 `FEISHU_DRIVE_FOLDER_TOKEN` 环境变量。若设置,bot 创建 docx 时带 `folder_token` 参数,文档落到用户云盘指定文件夹下,自动继承文件夹的「分享/可见」权限。绕开 `drive:drive` 权限难题。前提:文件夹所有者要在飞书 UI 把该文件夹分享给 bot 并给「可编辑」权限。

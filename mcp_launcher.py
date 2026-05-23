@@ -1152,69 +1152,17 @@ async def _llm_route(text: str) -> dict | None:
     Returns the parsed dict on success, or None on any failure
     (network error, invalid JSON, unknown preset/action) — caller should
     fall back to regex-based routing.
+
+    NOTE: 用 _deepseek_json_call 收口,与 summarizer / guru route / guru voice
+    共享截断检测 / 错误日志 / 90s read timeout。max_tokens 升到 1500 给推理留量。
     """
     if not FEISHU_USE_LLM_ROUTER:
         return None
-    api_key = (os.environ.get("DEEPSEEK_API_KEY")
-               or os.environ.get("OPENROUTER_API_KEY")
-               or os.environ.get("OPENAI_API_KEY") or "").strip()
-    base_url = (os.environ.get("DEEPSEEK_BASE_URL")
-                or os.environ.get("OPENROUTER_BASE_URL")
-                or os.environ.get("OPENAI_BASE_URL")
-                or "https://api.deepseek.com/v1").rstrip("/")
-    model = os.environ.get("LANGCHAIN_MODEL_NAME", "deepseek-v4-pro").strip()
-    if not api_key:
-        print("[feishu] LLM router skipped (no api key)", flush=True)
-        return None
-
-    body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": LLM_ROUTER_SYSTEM_PROMPT},
-            {"role": "user", "content": text},
-        ],
-        "response_format": {"type": "json_object"},
-        "max_tokens": 500,  # generous to allow reasoning_content for v4-pro
-        "temperature": 0,
-    }
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5, read=25, write=10, pool=5),
-        ) as c:
-            r = await c.post(
-                f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}",
-                         "Content-Type": "application/json"},
-                json=body,
-            )
-            if r.status_code != 200:
-                print(f"[feishu] LLM router HTTP {r.status_code}: {r.text[:200]}", flush=True)
-                return None
-            d = r.json()
-            if "choices" not in d:
-                print(f"[feishu] LLM router unexpected response: {d}", flush=True)
-                return None
-            msg = d["choices"][0]["message"]
-            content = msg.get("content") or ""
-            if not content:
-                # Reasoning models may put nothing in content. Try reasoning_content as last resort.
-                content = msg.get("reasoning_content") or ""
-                # Extract JSON from inside reasoning
-                m = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", content, re.DOTALL)
-                if not m:
-                    return None
-                content = m.group(0)
-    except Exception as e:
-        print(f"[feishu] LLM router exception: {type(e).__name__}: {e}", flush=True)
-        return None
-
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError:
-        print(f"[feishu] LLM router JSON parse failed: {content[:200]}", flush=True)
-        return None
-    if not isinstance(parsed, dict):
+    parsed, _err = await _deepseek_json_call(
+        system=LLM_ROUTER_SYSTEM_PROMPT, user=text, max_tokens=1500,
+        temperature=0, label="feishu/route", run_id="",
+    )
+    if not parsed or not isinstance(parsed, dict):
         return None
     action = parsed.get("action")
     if action not in KNOWN_ACTIONS:
@@ -1222,7 +1170,7 @@ async def _llm_route(text: str) -> dict | None:
     if action == "run_swarm":
         preset = parsed.get("preset")
         if preset not in KNOWN_PRESETS:
-            print(f"[feishu] LLM router returned unknown preset: {preset}", flush=True)
+            print(f"[feishu/route] unknown preset: {preset}", flush=True)
             return None
         if not parsed.get("target"):
             return None
@@ -1562,6 +1510,88 @@ def _get_llm_creds() -> tuple[str, str, str]:
     return api_key, base_url, model
 
 
+async def _deepseek_json_call(*, system: str, user: str, max_tokens: int,
+                               temperature: float = 0.1,
+                               label: str = "deepseek",
+                               run_id: str = "") -> tuple[dict | None, str]:
+    """Single call to DeepSeek expecting a JSON object response.
+
+    Returns (parsed_dict, error_str). On success, error_str is "".
+
+    Centralized handling for the reasoning-model failure modes that bit us:
+      - finish_reason=length → truncated → JSON parse will always fail,
+        return early with clear label (don't waste retries on truncation)
+      - Empty content → reasoning model spent budget on CoT,
+        DO NOT fall back to reasoning_content (that's free-form thought)
+      - JSON parse failures → log content snippet for diagnosis
+      - Network/HTTP/timeout → label-tagged log line
+
+    Read timeout 90s — DeepSeek v4-pro reasoning + long output (4-6K tokens)
+    can take 30-70s in practice. Tight 60s gave us flaky ReadTimeouts.
+
+    Callers handle retry strategy (temperature bump, etc.).
+    """
+    api_key, base_url, model = _get_llm_creds()
+    if not api_key:
+        return None, "no api key"
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10, read=90, write=15, pool=5),
+        ) as c:
+            r = await c.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}",
+                         "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    "response_format": {"type": "json_object"},
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                },
+            )
+            if r.status_code != 200:
+                err = f"HTTP {r.status_code}: {r.text[:200]}"
+                print(f"[{label}] {err} run={run_id}", flush=True)
+                return None, err
+            d = r.json()
+            choice = d["choices"][0]
+            msg = choice.get("message") or {}
+            finish_reason = choice.get("finish_reason") or ""
+            content = (msg.get("content") or "").strip()
+            if finish_reason == "length":
+                reasoning_len = len(msg.get("reasoning_content") or "")
+                err = (f"truncated (finish=length, content_len={len(content)}, "
+                       f"reasoning_len={reasoning_len}, max_tokens={max_tokens})")
+                print(f"[{label}] {err} run={run_id}", flush=True)
+                return None, err
+            if not content:
+                reasoning_len = len(msg.get("reasoning_content") or "")
+                err = (f"empty content (reasoning_len={reasoning_len}, "
+                       f"finish={finish_reason})")
+                print(f"[{label}] {err} run={run_id}", flush=True)
+                return None, err
+            m = re.search(r"\{[\s\S]*\}", content)
+            if not m:
+                err = f"no JSON object (content[:200]={content[:200]!r})"
+                print(f"[{label}] {err} run={run_id}", flush=True)
+                return None, err
+            try:
+                return json.loads(m.group(0)), ""
+            except json.JSONDecodeError as je:
+                err = (f"JSONDecodeError: {je} (content_len={len(content)}, "
+                       f"finish={finish_reason}, snippet={content[:200]!r})")
+                print(f"[{label}] {err} run={run_id}", flush=True)
+                return None, err
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        print(f"[{label}] exception {err} run={run_id}", flush=True)
+        return None, err
+
+
 async def _route_gurus(summary: dict, full_report: str, run_id: str) -> list[str]:
     """LLM picks 1-2 most relevant gurus. Whitelist-validated.
 
@@ -1575,10 +1605,6 @@ async def _route_gurus(summary: dict, full_report: str, run_id: str) -> list[str
                 if g.strip() in _GURU_PROFILES][:GURU_VIEW_MAX]
 
     if not _GURU_PROFILES:
-        return []
-
-    api_key, base_url, model = _get_llm_creds()
-    if not api_key:
         return []
 
     profile_blocks = "\n\n".join(
@@ -1605,52 +1631,23 @@ async def _route_gurus(summary: dict, full_report: str, run_id: str) -> list[str
         f"--- 报告片段(截前 4000 字) ---\n{(full_report or '')[:4000]}"
     )
 
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10, read=60, write=15, pool=5),
-        ) as c:
-            r = await c.post(
-                f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}",
-                         "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    "response_format": {"type": "json_object"},
-                    "max_tokens": 1500,
-                    "temperature": 0.3,
-                },
-            )
-            if r.status_code != 200:
-                print(f"[guru/route] HTTP {r.status_code} run={run_id}: "
-                      f"{r.text[:200]}", flush=True)
-                return []
-            d = r.json()
-            msg = d["choices"][0]["message"]
-            content = (msg.get("content") or msg.get("reasoning_content") or "").strip()
-            m = re.search(r"\{[\s\S]*\}", content)
-            if not m:
-                print(f"[guru/route] no JSON in response run={run_id}", flush=True)
-                return []
-            parsed = json.loads(m.group(0))
-            selected_raw = parsed.get("selected") or []
-            # Whitelist + dedupe + cap.
-            valid: list[str] = []
-            for name in selected_raw:
-                if isinstance(name, str) and name in _GURU_SKILLS and name not in valid:
-                    valid.append(name)
-                if len(valid) >= GURU_VIEW_MAX:
-                    break
-            print(f"[guru/route] run={run_id} selected={valid} "
-                  f"reason={parsed.get('reason','')[:120]}", flush=True)
-            return valid
-    except Exception as e:
-        print(f"[guru/route] exception run={run_id}: {type(e).__name__}: {e}",
-              flush=True)
+    # max_tokens 3000: 路由输出 JSON 小但 v4-pro 推理本身吃 token
+    parsed, _err = await _deepseek_json_call(
+        system=system, user=user_msg, max_tokens=3000, temperature=0.3,
+        label="guru/route", run_id=run_id,
+    )
+    if not parsed:
         return []
+    selected_raw = parsed.get("selected") or []
+    valid: list[str] = []
+    for name in selected_raw:
+        if isinstance(name, str) and name in _GURU_SKILLS and name not in valid:
+            valid.append(name)
+        if len(valid) >= GURU_VIEW_MAX:
+            break
+    print(f"[guru/route] run={run_id} selected={valid} "
+          f"reason={parsed.get('reason','')[:120]}", flush=True)
+    return valid
 
 
 async def _generate_single_guru_view(guru: str, full_report: str, summary: dict,
@@ -1664,10 +1661,6 @@ async def _generate_single_guru_view(guru: str, full_report: str, summary: dict,
     if not skill_text:
         return None
     display_name, school = GURU_META.get(guru, (guru, "未知派别"))
-
-    api_key, base_url, model = _get_llm_creds()
-    if not api_key:
-        return None
 
     system_prompt = (
         skill_text.strip()
@@ -1684,7 +1677,7 @@ async def _generate_single_guru_view(guru: str, full_report: str, summary: dict,
         + "- 操作建议要符合你这派的特色 (模式派→首板战法,控回撤派→4 点底线,进攻派→敢上重仓,等)\n"
         + "- 不复述报告原文,只给『你会怎么看』\n"
         + "- takeaway 是给一眼看的;full_view 才完整展开\n"
-        + "- 不适用时返回 null"
+        + "- 不适用时 takeaway 和 full_view 都返回空字符串"
     )
     headline = summary.get("headline") or summary.get("title") or ""
     badge = summary.get("badge") or ""
@@ -1692,52 +1685,20 @@ async def _generate_single_guru_view(guru: str, full_report: str, summary: dict,
         f"主报告结论: {badge} — {headline}\n\n"
         f"--- 完整报告(截前 8000 字) ---\n{(full_report or '')[:8000]}"
     )
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10, read=60, write=15, pool=5),
-        ) as c:
-            r = await c.post(
-                f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}",
-                         "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    "response_format": {"type": "json_object"},
-                    "max_tokens": 1500,
-                    "temperature": 0.4,
-                },
-            )
-            if r.status_code != 200:
-                print(f"[guru/{guru}] HTTP {r.status_code} run={run_id}: "
-                      f"{r.text[:200]}", flush=True)
-                return None
-            d = r.json()
-            msg = d["choices"][0]["message"]
-            content = (msg.get("content") or msg.get("reasoning_content") or "").strip()
-            if not content or content.lower() == "null":
-                return None
-            m = re.search(r"\{[\s\S]*\}", content)
-            if not m:
-                # Fallback: treat raw text as full_view, copy first 60 chars as takeaway
-                return {"takeaway": content[:60], "full_view": content}
-            try:
-                parsed = json.loads(m.group(0))
-            except json.JSONDecodeError:
-                return {"takeaway": content[:60], "full_view": content}
-            takeaway = (parsed.get("takeaway") or "").strip()
-            full_view = (parsed.get("full_view") or "").strip()
-            if not full_view and not takeaway:
-                return None
-            return {"takeaway": takeaway or full_view[:60],
-                    "full_view": full_view or takeaway}
-    except Exception as e:
-        print(f"[guru/{guru}] exception run={run_id}: {type(e).__name__}: {e}",
-              flush=True)
+
+    # max_tokens 3000: SKILL.md 在 system 里占大头,推理+输出双份
+    parsed, _err = await _deepseek_json_call(
+        system=system_prompt, user=user_msg, max_tokens=3000, temperature=0.4,
+        label=f"guru/{guru}", run_id=run_id,
+    )
+    if not parsed:
         return None
+    takeaway = (parsed.get("takeaway") or "").strip()
+    full_view = (parsed.get("full_view") or "").strip()
+    if not full_view and not takeaway:
+        return None
+    return {"takeaway": takeaway or full_view[:60],
+            "full_view": full_view or takeaway}
 
 
 async def _generate_youzi_views(full_report: str, summary: dict,
@@ -1807,91 +1768,31 @@ async def _summarize_report(run) -> dict | None:
     preset_name = getattr(run, "preset_name", "investment_committee")
     template = PRESET_TEMPLATE.get(preset_name, "stock_decision")
     system_prompt = _build_summarizer_prompt(template)
+    run_id = getattr(run, "id", "")
 
-    api_key = (os.environ.get("DEEPSEEK_API_KEY")
-               or os.environ.get("OPENROUTER_API_KEY")
-               or os.environ.get("OPENAI_API_KEY") or "").strip()
-    base_url = (os.environ.get("DEEPSEEK_BASE_URL")
-                or os.environ.get("OPENROUTER_BASE_URL")
-                or os.environ.get("OPENAI_BASE_URL")
-                or "https://api.deepseek.com/v1").rstrip("/")
-    model = os.environ.get("LANGCHAIN_MODEL_NAME", "deepseek-v4-pro").strip()
-    if not api_key:
-        return None
-
-    # Build context: run metadata + full_report. Cap to ~12K chars input.
     user_msg = (
-        f"preset: {getattr(run, 'preset_name', 'investment_committee')}\n"
+        f"preset: {preset_name}\n"
         f"user_vars: {json.dumps(getattr(run, 'user_vars', {}) or {}, ensure_ascii=False)}\n"
         f"tokens: in={getattr(run, 'total_input_tokens', 0)} "
         f"out={getattr(run, 'total_output_tokens', 0)}\n\n"
         f"--- 原始报告 ---\n{full_report[:12000]}"
     )
 
-    last_err: str = ""
+    # 3 次重试 — DeepSeek-v4-pro reasoning model 偶发 content 真空 / 截断,
+    # 升温重试可以打破确定性的坏模式。每次复用 _deepseek_json_call 的健壮性。
+    last_err = ""
     for attempt in range(1, 4):
-        try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=10, read=60, write=15, pool=5),
-            ) as c:
-                r = await c.post(
-                    f"{base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {api_key}",
-                             "Content-Type": "application/json"},
-                    json={
-                        "model": model,
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_msg},
-                        ],
-                        "response_format": {"type": "json_object"},
-                        # DeepSeek-v4-pro 是 reasoning model,推理本身吃 token,
-                        # 6000 给输出 JSON 留够空间避免截断
-                        "max_tokens": 6000,
-                        # Slightly bump temperature on retries to break determinism.
-                        "temperature": 0.1 + 0.1 * (attempt - 1),
-                    },
-                )
-                if r.status_code != 200:
-                    last_err = f"HTTP {r.status_code}: {r.text[:200]}"
-                    print(f"[summarizer] attempt {attempt} {last_err}", flush=True)
-                    continue
-                d = r.json()
-                choice = d["choices"][0]
-                msg = choice.get("message") or {}
-                finish_reason = choice.get("finish_reason") or ""
-                # 只取 content;reasoning_content 是 chain-of-thought,不是 JSON
-                content = (msg.get("content") or "").strip()
-                if finish_reason == "length":
-                    # 截断了,JSON 一定不完整,不浪费 parse 重试
-                    last_err = f"truncated (finish_reason=length, content_len={len(content)})"
-                    print(f"[summarizer] attempt {attempt}: {last_err}", flush=True)
-                    continue
-                if not content:
-                    # content 真空 — 落 reasoning_content 给运维看(不 parse)
-                    reasoning_len = len(msg.get("reasoning_content") or "")
-                    last_err = f"empty content (reasoning_len={reasoning_len}, finish={finish_reason})"
-                    print(f"[summarizer] attempt {attempt}: {last_err}", flush=True)
-                    continue
-                m = re.search(r"\{[\s\S]*\}", content)
-                if not m:
-                    last_err = f"no JSON object found (content[:120]={content[:120]!r})"
-                    print(f"[summarizer] attempt {attempt}: {last_err}", flush=True)
-                    continue
-                try:
-                    parsed = json.loads(m.group(0))
-                    # Ensure template field is set even if LLM missed it
-                    parsed.setdefault("template", template)
-                    return parsed
-                except json.JSONDecodeError as je:
-                    last_err = f"JSONDecodeError: {je} (content_len={len(content)}, finish={finish_reason})"
-                    print(f"[summarizer] attempt {attempt}: {last_err}", flush=True)
-                    continue
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-            print(f"[summarizer] attempt {attempt} exception: {last_err}", flush=True)
-            continue
-    print(f"[summarizer] all 3 attempts failed (last: {last_err})", flush=True)
+        parsed, err = await _deepseek_json_call(
+            system=system_prompt, user=user_msg, max_tokens=6000,
+            temperature=0.1 + 0.1 * (attempt - 1),
+            label=f"summarizer/{attempt}", run_id=run_id,
+        )
+        if parsed:
+            parsed.setdefault("template", template)
+            return parsed
+        last_err = err
+    print(f"[summarizer] all 3 attempts failed (last: {last_err}) run={run_id}",
+          flush=True)
     return None
 
 
@@ -2855,6 +2756,13 @@ async def _publish_terminal_run(run, info: dict) -> None:
             print(f"[publish] guru views ok {run_id}: "
                   f"{[v['guru'] for v in views]} "
                   f"(override={bool(gurus_override)})", flush=True)
+        else:
+            # 显式可见 — 之前是 silent skip,bug 时不知道这一环挂了。
+            # 三种合法 0 views 场景:1) preset 非 stock_decision 2) 报告非 A 股
+            #                    3) router/voice LLM 出问题 (上游 helper 已 log)
+            print(f"[publish] guru views EMPTY {run_id} "
+                  f"(preset={preset}, override={bool(gurus_override)}) — "
+                  f"卡片将不带 游资速看 段", flush=True)
     except Exception as e:
         print(f"[publish] guru exception {run_id}: {e}", flush=True)
 
