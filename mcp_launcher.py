@@ -163,6 +163,21 @@ def _jwt_decode(token: str) -> dict[str, Any] | None:
         return None
 
 
+# ─────────── run_id validation (path-traversal guard) ───────────
+# Upstream SwarmStore generates ids as f"swarm-{%Y%m%d}-{%H%M%S}-{uuid4().hex[:8]}"
+# (see vibe-trading-ai src/swarm/presets.py). run_id flows in from user / LLM
+# router and is used to build filesystem paths and to kill threads, so it must
+# be validated before any path join or thread targeting to prevent traversal
+# (e.g. "../../etc") leading to arbitrary directory deletion.
+_RUN_ID_RE = re.compile(r"^swarm-\d{8}-\d{6}-[0-9a-f]{4,}$")
+
+
+def _valid_run_id(run_id: str) -> bool:
+    if not run_id or "/" in run_id or "\\" in run_id or ".." in run_id:
+        return False
+    return _RUN_ID_RE.match(run_id) is not None
+
+
 # ─────────── base URL helpers ───────────
 def _base_from_request(request: Request) -> str:
     if PUBLIC_BASE_URL:
@@ -274,6 +289,33 @@ async def oauth_protected_resource(request):
 
 
 # ─────────── Dynamic Client Registration ───────────
+# client_id is a signed JWT that binds the redirect_uris supplied at
+# registration time. /authorize then enforces that the requested redirect_uri
+# was registered — preventing an attacker from substituting their own
+# redirect_uri to capture an authorization code (open-redirect / code theft).
+CLIENT_ID_TTL = 10 * 365 * 86400  # effectively long-lived; clients re-register via DCR
+
+
+def _client_redirect_uris(client_id: str) -> list[str] | None:
+    """Return the redirect_uris bound to this client_id at registration, or None
+    if client_id isn't a recognized signed registration token."""
+    if not client_id.startswith("mcp-"):
+        return None
+    p = _jwt_decode(client_id[len("mcp-"):])
+    if not p or p.get("typ") != "client":
+        return None
+    uris = p.get("redirect_uris")
+    return uris if isinstance(uris, list) else []
+
+
+def _redirect_uri_registered(client_id: str, redirect_uri: str) -> bool:
+    """True iff redirect_uri exactly matches one bound to client_id. Unknown /
+    legacy client_ids (None) and clients that registered no redirect_uri are
+    rejected — a usable OAuth client must register at least one redirect_uri."""
+    allowed = _client_redirect_uris(client_id)
+    return bool(allowed) and redirect_uri in allowed
+
+
 async def register(request):
     try:
         body = await request.json() if (await request.body()) else {}
@@ -281,10 +323,19 @@ async def register(request):
         body = {}
     if not isinstance(body, dict):
         body = {}
+    redirect_uris = body.get("redirect_uris", [])
+    if not isinstance(redirect_uris, list):
+        redirect_uris = []
+    redirect_uris = [u for u in redirect_uris if isinstance(u, str)][:10]
+    now = int(time.time())
+    client_id = "mcp-" + _jwt_encode({
+        "typ": "client", "redirect_uris": redirect_uris,
+        "iat": now, "exp": now + CLIENT_ID_TTL,
+    })
     return JSONResponse({
-        "client_id": "mcp-" + secrets.token_urlsafe(12),
-        "client_id_issued_at": int(time.time()),
-        "redirect_uris": body.get("redirect_uris", []),
+        "client_id": client_id,
+        "client_id_issued_at": now,
+        "redirect_uris": redirect_uris,
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
@@ -347,6 +398,9 @@ async def authorize_get(request):
         return HTMLResponse("unsupported_response_type", status_code=400)
     if params["code_challenge_method"] != "S256":
         return HTMLResponse("need S256", status_code=400)
+    if not _redirect_uri_registered(params["client_id"], params["redirect_uri"]):
+        return HTMLResponse("redirect_uri not registered for this client_id",
+                            status_code=400)
     return HTMLResponse(_render_login(params))
 
 
@@ -358,6 +412,11 @@ async def authorize_post(request):
               "code_challenge", "code_challenge_method"):
         if not params.get(k):
             return HTMLResponse(f"missing: {k}", status_code=400)
+    # Re-check redirect_uri binding here too — this is the security-critical
+    # path that issues the code and performs the redirect.
+    if not _redirect_uri_registered(params["client_id"], params["redirect_uri"]):
+        return HTMLResponse("redirect_uri not registered for this client_id",
+                            status_code=400)
     if not secrets.compare_digest(secret, EXPECTED_TOKEN):
         return HTMLResponse(_render_login(params, "Invalid token."), status_code=401)
     now = int(time.time())
@@ -502,6 +561,8 @@ async def debug_purge_run(request):
     run_id = request.query_params.get("run_id", "").strip()
     if not run_id:
         return JSONResponse({"error": "run_id required"}, status_code=400)
+    if not _valid_run_id(run_id):
+        return JSONResponse({"error": "invalid run_id format"}, status_code=400)
     out = {"run_id": run_id, "actions": []}
     target_name = f"swarm-{run_id}"
     for t in threading.enumerate():
@@ -525,6 +586,29 @@ async def debug_purge_run(request):
     return JSONResponse(out)
 
 
+# ─────────── shared SwarmRuntime singleton ───────────
+# A run's cancellation event lives in the SwarmRuntime instance that started it
+# (runtime._cancel_events, keyed by run_id). A fresh instance per call — as the
+# code used to do — can therefore never cooperatively cancel a run it didn't
+# start. Sharing one process-wide runtime lets cancel_run() signal runs started
+# by either the MCP tool or the Feishu path. SwarmRuntime is built to manage
+# many concurrent runs and guards its state with an internal lock.
+_swarm_runtime = None
+_swarm_runtime_lock = threading.Lock()
+
+
+def _get_swarm_runtime():
+    global _swarm_runtime
+    with _swarm_runtime_lock:
+        if _swarm_runtime is None:
+            import pathlib
+            from src.swarm.runtime import SwarmRuntime
+            from src.swarm.store import SwarmStore
+            swarm_dir = pathlib.Path(mcp_server.__file__).resolve().parent / ".swarm" / "runs"
+            _swarm_runtime = SwarmRuntime(store=SwarmStore(base_dir=swarm_dir))
+        return _swarm_runtime
+
+
 # ─────────── extra MCP tool: non-blocking swarm start ───────────
 @mcp_server.mcp.tool()
 def start_swarm_async(preset_name: str, variables: dict[str, str]) -> str:
@@ -542,11 +626,7 @@ def start_swarm_async(preset_name: str, variables: dict[str, str]) -> str:
     Returns:
         JSON string with run_id, preset, status="started", and a usage tip.
     """
-    from src.swarm.runtime import SwarmRuntime
-    from src.swarm.store import SwarmStore
-    swarm_dir = mcp_server.AGENT_DIR / ".swarm" / "runs"
-    store = SwarmStore(base_dir=swarm_dir)
-    runtime = SwarmRuntime(store=store)
+    runtime = _get_swarm_runtime()
     try:
         run = runtime.start_run(preset_name, variables)
     except FileNotFoundError as exc:
@@ -3021,12 +3101,7 @@ async def _fire_swarm(chat_id: str, preset: str, target: str | None,
             )
             return
 
-    from src.swarm.runtime import SwarmRuntime
-    from src.swarm.store import SwarmStore
-    import pathlib
-    swarm_dir = pathlib.Path(mcp_server.__file__).resolve().parent / ".swarm" / "runs"
-    store = SwarmStore(base_dir=swarm_dir)
-    runtime = SwarmRuntime(store=store)
+    runtime = _get_swarm_runtime()
     variables = _build_preset_vars(preset, target, market, raw_text)
     try:
         run = runtime.start_run(preset, variables)
@@ -3079,24 +3154,34 @@ async def _fire_swarm(chat_id: str, preset: str, target: str | None,
 
 
 async def _feishu_handle_cancel_run(chat_id: str, run_id: str) -> None:
-    """Kill a stuck/unwanted run. Mirrors /_debug/purge-run logic."""
-    import ctypes, pathlib, shutil
+    """Cancel a stuck/unwanted run, then clean up disk artifacts."""
+    import pathlib, shutil
     from src.swarm.store import SwarmStore
+    if not _valid_run_id(run_id):
+        _feishu_send_text(chat_id, "chat_id", f"run_id 格式非法: {run_id}")
+        return
     swarm_dir = pathlib.Path(mcp_server.__file__).resolve().parent / ".swarm" / "runs"
 
     actions: list[str] = []
-    # 1. Try the runtime's built-in cancel path (sets the cancel_event).
-    target_name = f"swarm-{run_id}"
-    killed_thread = False
-    for t in threading.enumerate():
-        if t.name == target_name and t.is_alive() and t.ident:
-            res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
-                ctypes.c_long(t.ident), ctypes.py_object(SystemExit))
-            actions.append(f"中止线程({t.name}) → {res}")
-            killed_thread = True
-            if res > 1:
-                ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(t.ident), 0)
-                actions.append("回滚")
+    # 1. Cooperative cancel — sets the run's cancel_event so the worker stops at
+    #    the next layer boundary (safe; no interpreter-state corruption). Works
+    #    only for runs started by this process's shared runtime.
+    if _get_swarm_runtime().cancel_run(run_id):
+        actions.append("已发送协作取消信号")
+    else:
+        # 1b. Fallback hard-stop for runs not tracked by the shared runtime
+        #     (e.g. started elsewhere). Async-raising SystemExit is best-effort
+        #     and can't interrupt blocking C/IO, so it's a last resort only.
+        import ctypes
+        target_name = f"swarm-{run_id}"
+        for t in threading.enumerate():
+            if t.name == target_name and t.is_alive() and t.ident:
+                res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                    ctypes.c_long(t.ident), ctypes.py_object(SystemExit))
+                actions.append(f"强制中止线程({t.name}) → {res}")
+                if res > 1:
+                    ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(t.ident), 0)
+                    actions.append("回滚")
 
     # 2. Mark run as cancelled in store (if it exists) so list_runs reflects it.
     store = SwarmStore(base_dir=swarm_dir)
@@ -3146,6 +3231,9 @@ async def _feishu_handle_list_presets(chat_id: str):
 async def _feishu_handle_status(chat_id: str, run_id: str):
     from src.swarm.store import SwarmStore
     import pathlib
+    if not _valid_run_id(run_id):
+        _feishu_send_text(chat_id, "chat_id", f"run_id 格式非法: {run_id}")
+        return
     swarm_dir = pathlib.Path(mcp_server.__file__).resolve().parent / ".swarm" / "runs"
     store = SwarmStore(base_dir=swarm_dir)
     try:

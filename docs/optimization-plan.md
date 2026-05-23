@@ -31,18 +31,18 @@
 
 ## 3. 问题清单与优先级
 
-| 编号 | 问题 | 严重度 | 触发条件 | 阶段 |
-|------|------|--------|----------|------|
-| P0-1 | 容器重启后向飞书重复推送所有历史报告 | 高 | 每次部署/重启 | 阶段一 |
-| P0-2 | 异步入站处理器内调用阻塞式 httpx,卡死事件循环 | 高 | 每次飞书消息 | 阶段一 |
-| P1-3 | `run_id` 路径穿越 → 任意目录删除 | 中(安全) | 恶意/异常 run_id | 阶段二 |
-| P1-4 | `asyncio.create_task` 未持引用,任务可能被 GC | 中 | 偶发 | 阶段一(随 P0-2 一并解决) |
-| P1-5 | 取消用线程名 `swarm-{run_id}` 可能双前缀,中止逻辑失效 | 中 | 用户取消 run | 阶段二 |
-| P1-6 | OAuth `redirect_uri` 未做注册绑定/校验 | 中 | 钓鱼场景 | 阶段二 |
-| P2-7 | 取消会无差别删除已完成 run 的报告 | 低 | 取消已完成 run | 阶段三 |
-| P2-8 | `/_debug/env` 泄露密钥前 6 位 | 低 | 持 Bearer 访问 | 阶段三 |
-| P2-9 | poll loop 串行发布,慢发布拖累其他 run | 低 | 高并发 | 阶段三 |
-| P2-10 | 入站处理器顶层 except 仅打印,用户零反馈 | 低 | 处理异常 | 阶段三 |
+| 编号 | 问题 | 严重度 | 触发条件 | 阶段 | 状态 |
+|------|------|--------|----------|------|------|
+| P0-1 | 容器重启后向飞书重复推送所有历史报告 | 高 | 每次部署/重启 | 阶段一 | ✅ 已实现 |
+| P0-2 | 异步入站处理器内调用阻塞式 httpx,卡死事件循环 | 高 | 每次飞书消息 | 阶段一 | ✅ 已实现 |
+| P1-3 | `run_id` 路径穿越 → 任意目录删除 | 中(安全) | 恶意/异常 run_id | 阶段二 | ✅ 已实现 |
+| P1-4 | `asyncio.create_task` 未持引用,任务可能被 GC | 中 | 偶发 | 阶段一(随 P0-2 一并解决) | ✅ 已实现 |
+| P1-5 | 取消用 `PyThreadState_SetAsyncExc` 而非上游协作式 `cancel_run` | 中 | 用户取消 run | 阶段二 | ✅ 已实现 |
+| P1-6 | OAuth `redirect_uri` 未做注册绑定/校验 | 中 | 钓鱼场景 | 阶段二 | ✅ 已实现 |
+| P2-7 | 取消会无差别删除已完成 run 的报告 | 低 | 取消已完成 run | 阶段三 | 待办 |
+| P2-8 | `/_debug/env` 泄露密钥前 6 位 | 低 | 持 Bearer 访问 | 阶段三 | 待办 |
+| P2-9 | poll loop 串行发布,慢发布拖累其他 run | 低 | 高并发 | 阶段三 | 待办 |
+| P2-10 | 入站处理器顶层 except 仅打印,用户零反馈 | 低 | 处理异常 | 阶段三 | 待办 |
 
 > P0-1 与 P0-2 会相互放大:P0-2 阻塞健康检查 → Railway 重启 → P0-1 重复推送。两者需在同一阶段一起修。
 
@@ -157,25 +157,29 @@ def _valid_run_id(run_id: str) -> bool:
 
 应用点:`_feishu_handle_cancel_run`、`_feishu_handle_status`、`_feishu_meta_path`/`_feishu_published_path` 的调用前、`debug_purge_run`。校验失败直接回"run_id 格式非法"。
 
-> ⚠️ 待确认:`_RUN_ID_RE` 需与上游 `SwarmStore` 的 id 生成规则核对(示例为 `swarm-20260506-171102-016a0768`)。若上游格式更宽,放宽正则但**保留** `/`、`\`、`..` 的硬拒绝作为兜底。
+> ✅ 已核验:上游 `presets.py:127` 生成 `run_id = f"swarm-{%Y%m%d-%H%M%S}-{uuid4().hex[:8]}"`,正则与之吻合;并保留 `/`、`\`、`..` 的硬拒绝作为兜底。
 
-**验证**:单元用例覆盖 `swarm-...`(通过)、`../etc`、`a/b`、空串(拒绝)。
+**验证**:已用 ast 抽取真实函数源 exec 后断言通过 —— `swarm-...` 通过,`../etc` / `a/b` / 空串 / 大写 hex 均拒绝。
 
 ---
 
-### P1-5 取消逻辑:线程名双前缀 + 未调用上游 cancel
+### P1-5 取消逻辑:改用上游协作式 `cancel_run`(已核验上游源码)
 
-**根因**
-`run.id` 形如 `swarm-2026...`,代码却拼 `target_name = f"swarm-{run_id}"`(`:3037`)= `swarm-swarm-2026...`,大概率匹配不到真实线程 → `PyThreadState_SetAsyncExc` 空转,swarm 并未真正中止,却已 `rmtree` run 目录(线程还在往已删目录写)。`:3036` 注释提到"runtime 内置 cancel(设置 cancel_event)",但代码实际并未调用该 API。
+**核验结论(纠正初评)**
+解包 `vibe-trading-ai==0.1.6` 后核对:
+- 上游线程名 = `f"swarm-{run.id}"`(`runtime.py:103`),而 `run.id` 本身就是 `swarm-...`,故 launcher 的 `target_name = f"swarm-{run_id}"` 与之**一致匹配**(两侧都双前缀)——初评"双前缀匹配不上"的判断**有误**,线程查杀其实能命中。
+- 上游**确有**协作式取消:`SwarmRuntime.cancel_run(run_id)`(`runtime.py:110`)设置 `cancel_event`,`_execute_run` 在每层边界检查并优雅收尾(`runtime.py:212`)。
+- 真正问题:① launcher 用危险的 `PyThreadState_SetAsyncExc(SystemExit)` 而非协作式取消(前者无法打断阻塞 C/IO,可能损坏 executor 状态);② `cancel_event` 存活于"启动该 run 的那个 `SwarmRuntime` 实例"里,而 launcher **每次调用都新建实例**(连上游 `mcp_server.py:338` 也是),导致 `cancel_run` 永远找不到事件。
 
-**方案(需先调研)**
-1. **首选**:核查 `SwarmRuntime` 是否提供 `cancel_run(run_id)` / `cancel_event` 之类的协作式取消 API;有则改为调用它,让上游优雅停止(协作式取消远比异步注入 `SystemExit` 安全——后者无法打断阻塞的 C 调用/网络 I/O)。
-2. **兜底**:若上游无 cancel API,修正线程名匹配——按"`t.name == run_id` 或 `t.name == f"swarm-{run_id}"` 或 `run_id in t.name`"宽松匹配,并先确认上游真实命名。
-3. 取消后再删 disk(见 P2-7,终态 run 不删报告)。
+**方案(已实现)**
+1. 引入**进程级共享 `SwarmRuntime` 单例** `_get_swarm_runtime()`,`start_swarm_async` 与 `_fire_swarm` 均改用它启动 run —— 这样 `cancel_run` 才能命中。
+2. 取消优先走协作式 `runtime.cancel_run(run_id)`(安全,层边界停止;配合 60s httpx 封顶,卡死调用有界收敛)。
+3. 仅当协作式返回 `False`(run 非本 runtime 启动,如上游 `run_swarm` 工具)才回退到线程查杀作为**末路兜底**。
+4. 入口先 `_valid_run_id` 校验(P1-3)。
 
-> ⚠️ 本环境未安装 `vibe-trading-ai`,无法直接核验线程命名与是否有 cancel API。此项实施前需 `pip download` 解包确认(README 已给命令)。
+> 备注:协作式取消在"当前层"内不立即生效(等该层 ThreadPoolExecutor 任务返回),但有 httpx 60s 封顶兜底,属可接受的安全权衡。终态 run 不删报告留待 P2-7(阶段三)。
 
-**验证**:起一个长 run,发"取消",确认线程确实停止(`/_debug/threads` 不再有该线程)且报告未被误删。
+**验证**:需在 sandbox 起长 run 发"取消",确认 `/_debug/threads` 中线程消失且报告未被误删(本环境无上游运行时,仅静态核验源码 + 编译通过)。
 
 ---
 
@@ -199,10 +203,11 @@ def _client_redirect_uris(client_id: str) -> list[str] | None:
     return p.get("redirect_uris") if p and p.get("typ") == "client" else None
 ```
 
-`authorize_get`/`authorize_post` 中:若该 client 注册了 redirect_uris,则要求请求的 `redirect_uri` 精确命中;命中失败返回 `invalid_request`(且**不**重定向,直接报错页,避免开放重定向)。
-**最小化备选**:若不想改 client_id 结构,至少限制 `redirect_uri` 的 scheme(仅 `https://` 或 `http://localhost`/`127.0.0.1`)以降低开放重定向风险。
+**已实现**:`/register` 把 `redirect_uris`(去重、取前 10 个 str)编进签名 client_id(`typ=client`,长有效期);`_redirect_uri_registered()` 在 `authorize_get` 与 `authorize_post`(安全关键路径)两处强制要求请求的 `redirect_uri` 精确命中注册集合,命中失败直接返回 400 报错页(**不**重定向,避免开放重定向)。`/token` 沿用既有的"code 内 redirect_uri 一致性"校验,无需改动。
 
-> 威胁模型说明:本服务"单一共享密钥=管理员",攻击者需诱导持密用户在显示攻击者 client_id 的页面输入口令,实际风险中等;但 redirect_uri 绑定是 OAuth 合规底线,建议补齐。
+> 兼容性:旧的随机 client_id(`mcp-<token_urlsafe>`)在 `/authorize` 会被判为未注册而拒绝 → 客户端按 DCR 自动重新注册即可恢复;Desktop/Code 走静态 Bearer 不涉 OAuth,无影响。
+>
+> 威胁模型说明:本服务"单一共享密钥=管理员",攻击者需诱导持密用户在显示攻击者 client_id 的页面输入口令,实际风险中等;但 redirect_uri 绑定是 OAuth 合规底线。
 
 **验证**:注册 client A(redirect=`https://a/cb`),用 A 的 client_id 但请求 `redirect_uri=https://evil/cb` 应被拒。
 
