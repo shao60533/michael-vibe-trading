@@ -234,12 +234,9 @@ def _client_redirect_uris(client_id: str) -> list[str] | None:
 
 ## 6. 测试与回归策略
 
-现状:仓库无测试,CI 仅 `py_compile` + skill/env 校验。
-
-- **新增最小 pytest**(`tests/test_helpers.py`),覆盖纯函数:`_valid_run_id`、`_extract_target`、`_classify_preset`、`_parse_explicit_preset`、`_md_to_feishu_blocks`、`_is_feishu_published`/`_mark_feishu_published`(用 tmp_path)。
-- **CI**:在 `ci.yml` 增加 `pytest -q`(若引入 pytest 依赖)。
-- **本地烟测**:用飞书测试企业 sandbox 跑一遍"分析 SOXL → 推回卡片",并手动重启进程验证不重复推送、`/healthz` 在慢发送期间仍即时 200。
-- 阶段一务必先验证 P0-1 的 restore/标记闭环(见 P0-1 验证步骤)。
+- **✅ 已加 pytest**(`tests/test_helpers.py`,17 个用例):覆盖 `_valid_run_id`、JWT/base64url 往返与防篡改、OAuth redirect 绑定(`_client_redirect_uris`/`_redirect_uri_registered`)、`_extract_target`、`_classify_preset`、`_parse_explicit_preset`、`_strip_mentions`、`_md_to_feishu_blocks`(含表格/divider)、`_parse_inline_md`。`tests/conftest.py` 用 stub 注入容器才有的 httpx/starlette/mcp_server,使**真实** `mcp_launcher` 源码可在无重依赖环境(含 CI)导入受测。
+- **✅ CI**:`ci.yml` 在 py_compile 后新增 `pip install pytest && pytest tests/ -q`。
+- **本地烟测(仍需在 sandbox 做)**:飞书测试企业跑一遍"分析 SOXL → 推回卡片",并手动重启进程验证不重复推送、`/healthz` 在慢发送期间仍即时 200;起长 run 发"取消"确认线程停止且完成态报告不被删。
 
 ## 7. 风险与回滚
 
