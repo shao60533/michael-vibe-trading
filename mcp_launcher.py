@@ -487,9 +487,12 @@ async def debug_env(_):
     keys = [
         "MCP_AUTH_TOKEN", "LARK_APP_ID", "LARK_APP_SECRET",
         "FEISHU_VERIFICATION_TOKEN", "FEISHU_DEFAULT_PRESET",
+        "FEISHU_DOC_SHARE_ENTITY", "FEISHU_DRIVE_FOLDER_TOKEN",
+        "FEISHU_USE_LLM_ROUTER",
         "NOTION_API_KEY", "NOTION_DATABASE_ID", "NOTION_PARENT_PAGE_ID",
         "LANGCHAIN_PROVIDER", "LANGCHAIN_MODEL_NAME",
         "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL",
+        "GURU_VIEW_MODE", "GURU_VIEW_MAX",
     ]
     out = {}
     for k in keys:
@@ -631,7 +634,9 @@ async def debug_republish(request):
       preset (default investment_committee),
       target (optional),
       chat_type (default chat_id),
-      gurus_override (optional list of guru skill names)
+      gurus_override (optional list of guru skill names),
+      skip_feishu_card (optional bool, default false — skip sending IM card to
+        chat. Useful when补 docx/notion 但不想再发卡片到群里)
     }
 
     Builds a synthetic Run object so we don't depend on disk state being intact.
@@ -647,6 +652,7 @@ async def debug_republish(request):
     target = (body.get("target") or "").strip()
     chat_type = (body.get("chat_type") or "chat_id").strip() or "chat_id"
     gurus_override = body.get("gurus_override") or []
+    skip_feishu_card = bool(body.get("skip_feishu_card", False))
     if not run_id or not chat_id or not final_report:
         return JSONResponse(
             {"error": "run_id, chat_id, final_report all required"},
@@ -667,7 +673,8 @@ async def debug_republish(request):
             "sender_open_id": "", "chat_type": "", "target": target,
             "preset": preset,
             "gurus_override": [g for g in gurus_override
-                                if g in _GURU_SKILLS][:GURU_VIEW_MAX]}
+                                if g in _GURU_SKILLS][:GURU_VIEW_MAX],
+            "skip_feishu_card": skip_feishu_card}
     try:
         await _publish_terminal_run(fake_run, info)
     except Exception as e:
@@ -1583,7 +1590,8 @@ async def _route_gurus(summary: dict, full_report: str, run_id: str) -> list[str
         "硬规则：\n"
         f"- 选 1 位还是多位看报告内容：格局明确就 1 位即可，复杂(主线+龙头/首板+控回撤)再选 2 位，最多 {GURU_VIEW_MAX} 位\n"
         "- 选多位时必须是**不同派别**，互补视角，不要两个同派\n"
-        "- 如果报告不是 A 股短线场景 (美股/港股/加密/期货/宏观/纯长线)，返回空 selected: []\n"
+        "- 范围:**所有 A 股股票分析都在范围内** — 基本面/财报/技术面/价值/估值 都让相应风格的游资从他们的视角(主线归属 / 资金面 / 情绪节奏 / 龙头格局)给观点,即使报告本身是长线/基本面取向\n"
+        "- 仅当报告**完全不涉及 A 股股票** (美股/港股/加密/期货/纯宏观/纯利率/纯汇率)，才返回空 selected: []\n"
         "- 只返回 JSON，不要其他文字：\n"
         '  {"selected": ["name1", "name2"], "reason": "为啥选他们 + 互补点"}\n'
         f"- name 严格只能是这 10 个之一：{', '.join(GURU_LIST)}\n\n"
@@ -2839,6 +2847,10 @@ async def _publish_terminal_run(run, info: dict) -> None:
     # 4. Feishu interactive card with both links. If card send fails, send a
     #    short text pointing to the off-chat surfaces (doc + Notion) — no raw
     #    markdown dump in chat.
+    if info.get("skip_feishu_card"):
+        print(f"[publish] feishu card skipped {run_id} (skip_feishu_card)",
+              flush=True)
+        return
     try:
         card = _build_feishu_card(summary, run_id, notion_url=notion_url,
                                   feishu_doc_url=feishu_doc_url)
