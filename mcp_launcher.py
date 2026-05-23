@@ -795,7 +795,7 @@ LLM_ROUTER_SYSTEM_PROMPT = """你是一个交易研究 Bot 的命令路由器。
 
 ## 支持的 action(8 种)
 
-- `run_swarm`: 跑新分析。字段 `preset`、`target`、`market`
+- `run_swarm`: 跑新分析。字段 `preset`、`target`、`market`、可选 `gurus`(数组,1-2 个 A 股游资 skill 名,见下表)
 - `list_runs`: 列历史 run。可选字段 `status_filter` (`completed`/`failed`/`running`/`cancelled`),可选 `limit`(默认 10)
 - `status`: 获取某 run 的报告或当前进度。字段 `run_id`(支持特殊值 `"latest"` = 最近一次 completed 的 run)
 - `cancel_run`: 杀掉一个卡死/不想要的 run。字段 `run_id`(也支持 `"latest"`)
@@ -834,6 +834,42 @@ LLM_ROUTER_SYSTEM_PROMPT = """你是一个交易研究 Bot 的命令路由器。
 - `equity_research_team` 股票研究
 - `global_equities_desk` 全球股票
 - `convertible_bond_team` 可转债
+
+## 10 位 A 股游资 skill(可选,只用于 stock_decision 类 preset)
+
+用户可以指定 1-2 位游资来给报告下方观点。识别用户消息里的游资名/派别后,在输出 JSON 里加 `gurus` 字段(skill 名数组,最多 2 个)。**只对 A 股相关分析有效**,美股/港股/加密/macro 不要带 gurus 字段。
+
+| skill 名 | 中文/别名 | 派别 |
+|---|---|---|
+| `xiao-eyu` | 小鳄鱼 | 理解力派(通用) |
+| `bei-jing-chao-jia` | 北京炒家 | 模式派(首板战法) |
+| `chen-xiao-qun` | 陈小群、群神 | 龙头信仰派(主升浪锁仓) |
+| `jiu-er-ke-bi` | 92 科比、科比 | 情绪周期派(高低切) |
+| `nie-pan-chong-sheng` | 涅盘重升、升大 | 资金流派(强势形态低吸) |
+| `yi-shun-liu-guang` | 一瞬流光、光神 | 高位接力派(锁 2 板) |
+| `xiang-cheng-cai-lian-lu` | 采莲路、川哥 | 控回撤派(4 点底线) |
+| `xiao-rui-rui` | 小睿睿、睿神、小睿睿8 | 进攻派(敢上重仓) |
+| `hua-dong-da-dao-dan` | 华东大导弹、大导弹 | 低频狙击派(空仓为主) |
+| `gui-yin` | 归因 | 资讯派(逻辑驱动低吸) |
+
+例子:
+
+输入: `用陈小群视角看下 茅台`
+输出: `{"action":"run_swarm","preset":"investment_committee","target":"600519.SH","market":"CN","gurus":["chen-xiao-qun"]}`
+
+输入: `分析 002594,用北京炒家和小鳄鱼的玩法`
+输出: `{"action":"run_swarm","preset":"investment_committee","target":"002594.SZ","market":"CN","gurus":["bei-jing-chao-jia","xiao-eyu"]}`
+
+输入: `小睿睿会怎么看 中际旭创`
+输出: `{"action":"run_swarm","preset":"investment_committee","target":"300308.SZ","market":"CN","gurus":["xiao-rui-rui"]}`
+
+输入: `控回撤派看 隆基`
+输出: `{"action":"run_swarm","preset":"investment_committee","target":"601012.SH","market":"CN","gurus":["xiang-cheng-cai-lian-lu"]}`
+
+输入: `用龙头信仰派+情绪周期派分析 比亚迪`
+输出: `{"action":"run_swarm","preset":"investment_committee","target":"002594.SZ","market":"CN","gurus":["chen-xiao-qun","jiu-er-ke-bi"]}`
+
+注意:用户没指定游资时**不要**加 gurus 字段——会由系统自动 LLM 路由选 1-2 位。
 
 ## target 标准格式
 
@@ -1032,7 +1068,8 @@ def _feishu_meta_path(run_id: str):
 
 def _write_feishu_meta(run_id: str, chat_id: str, receive_id_type: str,
                         sender_open_id: str, chat_type: str = "",
-                        target: str = "", preset: str = "") -> None:
+                        target: str = "", preset: str = "",
+                        gurus_override: list[str] | None = None) -> None:
     """Persist routing info for this run so we can publish back to the right chat
     even after a container restart."""
     p = _feishu_meta_path(run_id)
@@ -1046,6 +1083,7 @@ def _write_feishu_meta(run_id: str, chat_id: str, receive_id_type: str,
             "chat_type": chat_type or "",  # 'p2p' or 'group'
             "target": target or "",
             "preset": preset or "",
+            "gurus_override": gurus_override or [],
             "created_at": time.time(),
         }, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
@@ -1493,10 +1531,12 @@ async def _generate_single_guru_view(guru: str, full_report: str, summary: dict,
 
 
 async def _generate_youzi_views(full_report: str, summary: dict,
-                                 preset: str, run_id: str) -> list[dict]:
+                                 preset: str, run_id: str,
+                                 gurus_override: list[str] | None = None) -> list[dict]:
     """Pick 1-2 gurus via LLM router, generate each voice in parallel.
 
-    Returns list of {"guru","display_name","school","text"} (possibly empty).
+    When `gurus_override` is non-empty, skip routing and use those gurus
+    (whitelist-validated). Returns list of {"guru","display_name","school","text"}.
     """
     if GURU_VIEW_MODE == "off":
         return []
@@ -1505,7 +1545,12 @@ async def _generate_youzi_views(full_report: str, summary: dict,
     if not full_report or not _GURU_SKILLS:
         return []
 
-    selected = await _route_gurus(summary, full_report, run_id)
+    if gurus_override:
+        selected = [g for g in gurus_override
+                    if g in _GURU_SKILLS][:GURU_VIEW_MAX]
+        print(f"[guru] run={run_id} using user override: {selected}", flush=True)
+    else:
+        selected = await _route_gurus(summary, full_report, run_id)
     if not selected:
         return []
 
@@ -2528,13 +2573,16 @@ async def _publish_terminal_run(run, info: dict) -> None:
             print(f"[publish] summary-fail send err {run_id}: {e}", flush=True)
         return
 
-    # 1b. 游资观点 (multi-guru) — LLM 路由选 1-2 位互补游资,仅 stock_decision preset.
+    # 1b. 游资观点 (multi-guru) — 用户指定 gurus_override > LLM 路由,仅 stock_decision preset.
     try:
-        views = await _generate_youzi_views(full_report, summary, preset, run_id)
+        gurus_override = info.get("gurus_override") or []
+        views = await _generate_youzi_views(full_report, summary, preset, run_id,
+                                             gurus_override=gurus_override)
         if views:
             summary["youzi_views"] = views
             print(f"[publish] guru views ok {run_id}: "
-                  f"{[v['guru'] for v in views]}", flush=True)
+                  f"{[v['guru'] for v in views]} "
+                  f"(override={bool(gurus_override)})", flush=True)
     except Exception as e:
         print(f"[publish] guru exception {run_id}: {e}", flush=True)
 
@@ -2784,6 +2832,10 @@ async def _feishu_handle_message(body: dict):
         if llm_result is not None:
             action = llm_result.get("action")
             if action == "run_swarm":
+                # Optional guru override — only honored when LLM router extracted
+                # explicit names; whitelist-filtered downstream in _fire_swarm.
+                gurus_raw = llm_result.get("gurus") or []
+                gurus = [g for g in gurus_raw if isinstance(g, str)] if isinstance(gurus_raw, list) else []
                 await _fire_swarm(
                     chat_id,
                     llm_result.get("preset") or FEISHU_DEFAULT_PRESET,
@@ -2792,6 +2844,7 @@ async def _feishu_handle_message(body: dict):
                     text,
                     sender_open_id=sender_open_id,
                     chat_type=chat_type,
+                    gurus_override=gurus,
                 )
             elif action == "list_runs":
                 await _feishu_handle_list_runs(
@@ -2879,7 +2932,8 @@ _PRESET_ZH = {
 async def _fire_swarm(chat_id: str, preset: str, target: str | None,
                       market: str | None, raw_text: str,
                       sender_open_id: str = "",
-                      chat_type: str = "") -> None:
+                      chat_type: str = "",
+                      gurus_override: list[str] | None = None) -> None:
     """Start a swarm run, register for poll-back, ack to user."""
     ENTITY_OPTIONAL_PRESETS = {
         "macro_strategy_forum", "macro_rates_fx_desk",
@@ -2936,6 +2990,10 @@ async def _fire_swarm(chat_id: str, preset: str, target: str | None,
         _feishu_send_text(chat_id, "chat_id", f"启动 swarm 失败: {e}")
         return
 
+    # Whitelist guru override against loaded skills, cap at GURU_VIEW_MAX.
+    safe_gurus = [g for g in (gurus_override or [])
+                  if g in _GURU_SKILLS][:GURU_VIEW_MAX] if gurus_override else []
+
     meta_payload = {
         "receive_id": chat_id,
         "receive_id_type": "chat_id",
@@ -2943,21 +3001,27 @@ async def _fire_swarm(chat_id: str, preset: str, target: str | None,
         "chat_type": chat_type,
         "target": target or "",
         "preset": preset,
+        "gurus_override": safe_gurus,
     }
     with _feishu_pending_lock:
         _feishu_pending[run.id] = meta_payload
     # Persist to disk so restart can recover routing.
     _write_feishu_meta(run.id, chat_id, "chat_id", sender_open_id, chat_type,
-                       target=target or "", preset=preset)
+                       target=target or "", preset=preset,
+                       gurus_override=safe_gurus)
 
     preset_zh = _PRESET_ZH.get(preset, preset)
     if target:
         head = f"📊 {target}({market or '?'}) · {preset_zh}"
     else:
         head = f"📊 {preset_zh}"
+    guru_line = ""
+    if safe_gurus:
+        guru_names = " + ".join(GURU_META.get(g, (g, ""))[0] for g in safe_gurus)
+        guru_line = f"\n🐊 指定游资: {guru_names}"
     _feishu_send_text(
         chat_id, "chat_id",
-        f"{head}\n开始分析,预计 5-15 分钟,完成自动推回。\n"
+        f"{head}{guru_line}\n开始分析,预计 5-15 分钟,完成自动推回。\n"
         f"查进度发:查一下 {run.id}",
     )
 
