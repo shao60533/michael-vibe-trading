@@ -99,10 +99,30 @@ AUTH_CODE_TTL = 300
 ACCESS_TOKEN_TTL = 3600
 REFRESH_TOKEN_TTL = 30 * 86400
 
-# OAuth dynamic client registration (DCR) — 服务端保存 client_id 及其
-# redirect_uris allowlist。为了简化 Railway 重启场景,落到 /tmp 文件;
-# 容器重启后已注册的 client 可恢复(但 MCP 客户端 token 失效时本来就要重新走
-# DCR + authorize,所以丢失也只是给用户多一次登录,不会破坏安全模型)。
+# ─────────── 持久化状态目录(必须放在引用 STATE_DIR 之前) ───────────
+# Railway 容器 ephemeral,默认每次 deploy 擦盘。设置 STATE_DIR 指向 Railway Volume
+# 挂载路径(如 /app/data),把以下状态搬到 Volume,deploy 后保留:
+#   - swarm runs (.swarm/runs/{run_id}/...) — 报告 + feishu_meta + events
+#   - oauth_clients.json — OAuth DCR 注册表
+# 不设 STATE_DIR 时退化到老行为(写到 site-packages 下,deploy 清零)。
+STATE_DIR = os.environ.get("STATE_DIR", "").strip().rstrip("/")
+if STATE_DIR:
+    import pathlib as _pathlib
+    _state_path = _pathlib.Path(STATE_DIR)
+    try:
+        _state_path.mkdir(parents=True, exist_ok=True)
+        (_state_path / ".swarm" / "runs").mkdir(parents=True, exist_ok=True)
+        # 覆盖 mcp_server.AGENT_DIR — swarm runtime 内部 `AGENT_DIR/.swarm/runs`
+        # 等所有路径推导随之改变,旧 run + 新 run 都落到 Volume。
+        mcp_server.AGENT_DIR = _state_path
+        print(f"[boot] STATE_DIR active: {STATE_DIR} "
+              f"(swarm runs → {STATE_DIR}/.swarm/runs)", flush=True)
+    except Exception as _e:
+        print(f"[boot] WARN: STATE_DIR={STATE_DIR} setup failed: {_e}; "
+              f"falling back to ephemeral site-packages",
+              file=sys.stderr, flush=True)
+        STATE_DIR = ""
+
 # OAuth clients 持久化路径:若 STATE_DIR 设置则落 Volume,否则 fallback /tmp
 _OAUTH_CLIENTS_PATH = (f"{STATE_DIR}/oauth_clients.json" if STATE_DIR
                        else "/tmp/oauth_clients.json")
@@ -153,29 +173,7 @@ FEISHU_LINK_SHARE_ENTITIES = frozenset({
     "closed",
 })
 
-# ─────────── 持久化状态目录 ───────────
-# Railway 容器 ephemeral,默认每次 deploy 擦盘。设置 STATE_DIR 指向 Railway Volume
-# 挂载路径(如 /app/data),把以下状态搬到 Volume,deploy 后保留:
-#   - swarm runs (.swarm/runs/{run_id}/...) — 报告 + feishu_meta + events
-#   - oauth_clients.json — OAuth DCR 注册表
-# 不设 STATE_DIR 时退化到老行为(写到 site-packages 下,deploy 清零)。
-STATE_DIR = os.environ.get("STATE_DIR", "").strip().rstrip("/")
-if STATE_DIR:
-    import pathlib as _pathlib
-    _state_path = _pathlib.Path(STATE_DIR)
-    try:
-        _state_path.mkdir(parents=True, exist_ok=True)
-        (_state_path / ".swarm" / "runs").mkdir(parents=True, exist_ok=True)
-        # 覆盖 mcp_server.AGENT_DIR — swarm runtime 内部 `AGENT_DIR/.swarm/runs`
-        # 等所有路径推导随之改变,旧 run + 新 run 都落到 Volume。
-        mcp_server.AGENT_DIR = _state_path
-        print(f"[boot] STATE_DIR active: {STATE_DIR} "
-              f"(swarm runs → {STATE_DIR}/.swarm/runs)", flush=True)
-    except Exception as _e:
-        print(f"[boot] WARN: STATE_DIR={STATE_DIR} setup failed: {_e}; "
-              f"falling back to ephemeral site-packages",
-              file=sys.stderr, flush=True)
-        STATE_DIR = ""
+# (STATE_DIR 已在文件前部声明,避免向前引用)
 
 # Notion integration (optional). Set EITHER:
 #   NOTION_DATABASE_ID    → reports become DB rows with structured properties
