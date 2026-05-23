@@ -540,6 +540,81 @@ async def debug_list_feishu_chats(_):
     return JSONResponse({"count": len(out), "chats": out})
 
 
+async def debug_fix_historic_doc_share(request):
+    """Bulk-set link-share=tenant_readable on every docx the bot owns,
+    retroactively fixing docs created before FEISHU_DOC_SHARE_ENTITY was added.
+
+    Query params:
+      entity (default tenant_readable)
+      dry_run (default false): if 'true', only list counts, don't patch
+      page_cap (default 20): max pages of 50 files each (1000 docs)
+    """
+    if not FEISHU_ENABLED:
+        return JSONResponse({"error": "feishu disabled"}, status_code=400)
+    entity = (request.query_params.get("entity") or "tenant_readable").strip()
+    dry_run = (request.query_params.get("dry_run") or "").lower() in ("1", "true", "yes")
+    page_cap = max(1, min(40, int(request.query_params.get("page_cap") or "20")))
+
+    try:
+        token = _feishu_get_tenant_token()
+    except Exception as e:
+        return JSONResponse({"error": f"tenant_token: {e}"}, status_code=500)
+
+    all_files: list[dict] = []
+    page_token = ""
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            for _ in range(page_cap):
+                params = {"page_size": 50, "order_by": "EditedTime", "direction": "DESC"}
+                if page_token:
+                    params["page_token"] = page_token
+                r = await c.get(
+                    "https://open.feishu.cn/open-apis/drive/v1/files",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params=params,
+                )
+                d = r.json()
+                if d.get("code") != 0:
+                    return JSONResponse(
+                        {"error": d.get("msg"), "code": d.get("code"), "stage": "list"},
+                        status_code=500)
+                all_files.extend(d.get("data", {}).get("files", []) or [])
+                page_token = d.get("data", {}).get("next_page_token") or ""
+                if not d.get("data", {}).get("has_more"):
+                    break
+    except Exception as e:
+        return JSONResponse({"error": f"list: {type(e).__name__}: {e}"}, status_code=500)
+
+    docxs = [f for f in all_files if f.get("type") == "docx"]
+
+    if dry_run:
+        return JSONResponse({
+            "total_files": len(all_files),
+            "docx_count": len(docxs),
+            "dry_run": True,
+            "sample": [{"token": f.get("token"), "name": f.get("name")} for f in docxs[:5]],
+        })
+
+    ok = 0
+    failures: list[str] = []
+    for f in docxs:
+        tk = f.get("token", "")
+        if not tk:
+            continue
+        if await asyncio.to_thread(_feishu_set_doc_link_share, tk, entity):
+            ok += 1
+        else:
+            failures.append(f.get("name") or tk)
+    return JSONResponse({
+        "total_files": len(all_files),
+        "docx_count": len(docxs),
+        "ok": ok,
+        "fail": len(failures),
+        "entity": entity,
+        "first_failures": failures[:5],
+    })
+
+
 async def debug_republish(request):
     """Trigger _publish_terminal_run for a finished run that wasn't auto-published
     (e.g., run was started via MCP run_swarm tool with no Feishu chat context,
@@ -3416,6 +3491,7 @@ app = Starlette(
         Route("/_debug/env", debug_env),
         Route("/_debug/list-feishu-chats", debug_list_feishu_chats),
         Route("/_debug/republish", debug_republish, methods=["POST"]),
+        Route("/_debug/fix-historic-doc-share", debug_fix_historic_doc_share),
         Mount("/", app=mcp_app),
     ],
     middleware=[Middleware(AuthMiddleware)],
