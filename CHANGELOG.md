@@ -19,6 +19,19 @@ cut 版本时把 `[Unreleased]` 整体移到一个带日期的版本号下，再
 
 ## [Unreleased]
 
+### Added
+
+- **`STATE_DIR` 持久化状态**:新环境变量,指向 Railway Volume 挂载路径(如 `/app/data`)。设置后,swarm runs(`.swarm/runs/{id}/`,包含报告 + feishu_meta + events)+ OAuth DCR registry(`oauth_clients.json`)落到 Volume,deploy 之间持久保留。不设时退化到 ephemeral 老行为。启动时打 `[boot] STATE_DIR active: ...` 日志。
+
+### Changed
+
+- **可观测性大幅增强** — Feishu 消息处理链路的每个分支决策点都打 log,不再 silent return:
+  - `feishu_events` webhook 入口:`[feishu/webhook] event_type=X event_id=Y src=IP`,以及 url_verification / 非 im.message.receive_v1 / 未知 body shape 等都明确 log
+  - `_feishu_handle_message`:接收日志(chat/sender/msg_type)+ 每个 silent return(missing chat_id / msg_type 非 text / content JSON 解析失败 / text 为空)都 log 原因
+  - `_llm_route`:input log + output log + reject 原因(unknown action / unknown preset / no target / no run_id)分别 log
+  - dispatcher:`[feishu/dispatch] action=X preset=Y target=Z gurus=...`,regex fallback 也 log
+  - 之前用户发指令但没结果时无法定位是哪一环挂了 → 现在每一环都有迹可循
+
 ### Security (重要 — 行为有 breaking 变化)
 
 - **OAuth 加固**:

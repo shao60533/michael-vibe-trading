@@ -103,7 +103,9 @@ REFRESH_TOKEN_TTL = 30 * 86400
 # redirect_uris allowlist。为了简化 Railway 重启场景,落到 /tmp 文件;
 # 容器重启后已注册的 client 可恢复(但 MCP 客户端 token 失效时本来就要重新走
 # DCR + authorize,所以丢失也只是给用户多一次登录,不会破坏安全模型)。
-_OAUTH_CLIENTS_PATH = "/tmp/oauth_clients.json"
+# OAuth clients 持久化路径:若 STATE_DIR 设置则落 Volume,否则 fallback /tmp
+_OAUTH_CLIENTS_PATH = (f"{STATE_DIR}/oauth_clients.json" if STATE_DIR
+                       else "/tmp/oauth_clients.json")
 _oauth_clients: dict[str, dict] = {}
 _oauth_clients_lock = threading.Lock()
 
@@ -150,6 +152,30 @@ FEISHU_LINK_SHARE_ENTITIES = frozenset({
     "anyone_readable", "anyone_editable",
     "closed",
 })
+
+# ─────────── 持久化状态目录 ───────────
+# Railway 容器 ephemeral,默认每次 deploy 擦盘。设置 STATE_DIR 指向 Railway Volume
+# 挂载路径(如 /app/data),把以下状态搬到 Volume,deploy 后保留:
+#   - swarm runs (.swarm/runs/{run_id}/...) — 报告 + feishu_meta + events
+#   - oauth_clients.json — OAuth DCR 注册表
+# 不设 STATE_DIR 时退化到老行为(写到 site-packages 下,deploy 清零)。
+STATE_DIR = os.environ.get("STATE_DIR", "").strip().rstrip("/")
+if STATE_DIR:
+    import pathlib as _pathlib
+    _state_path = _pathlib.Path(STATE_DIR)
+    try:
+        _state_path.mkdir(parents=True, exist_ok=True)
+        (_state_path / ".swarm" / "runs").mkdir(parents=True, exist_ok=True)
+        # 覆盖 mcp_server.AGENT_DIR — swarm runtime 内部 `AGENT_DIR/.swarm/runs`
+        # 等所有路径推导随之改变,旧 run + 新 run 都落到 Volume。
+        mcp_server.AGENT_DIR = _state_path
+        print(f"[boot] STATE_DIR active: {STATE_DIR} "
+              f"(swarm runs → {STATE_DIR}/.swarm/runs)", flush=True)
+    except Exception as _e:
+        print(f"[boot] WARN: STATE_DIR={STATE_DIR} setup failed: {_e}; "
+              f"falling back to ephemeral site-packages",
+              file=sys.stderr, flush=True)
+        STATE_DIR = ""
 
 # Notion integration (optional). Set EITHER:
 #   NOTION_DATABASE_ID    → reports become DB rows with structured properties
@@ -631,7 +657,7 @@ async def debug_threads(_):
 
 async def debug_swarm_state(_):
     import pathlib
-    runs_dir = pathlib.Path(mcp_server.__file__).resolve().parent / ".swarm" / "runs"
+    runs_dir = mcp_server.AGENT_DIR / ".swarm" / "runs"
     if not runs_dir.exists():
         return JSONResponse({"error": "runs_dir missing", "path": str(runs_dir)})
     out = {"runs_dir": str(runs_dir), "runs": []}
@@ -878,7 +904,7 @@ async def debug_purge_run(request):
             if res > 1:
                 ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(t.ident), 0)
                 out["actions"].append("rolled back")
-    runs_dir = pathlib.Path(mcp_server.__file__).resolve().parent / ".swarm" / "runs"
+    runs_dir = mcp_server.AGENT_DIR / ".swarm" / "runs"
     target = runs_dir / run_id
     if target.exists():
         try:
@@ -1337,25 +1363,35 @@ async def _llm_route(text: str) -> dict | None:
     共享截断检测 / 错误日志 / 90s read timeout。max_tokens 升到 1500 给推理留量。
     """
     if not FEISHU_USE_LLM_ROUTER:
+        print(f"[feishu/route] LLM router disabled by env", flush=True)
         return None
+    print(f"[feishu/route] input: text={text[:120]!r}", flush=True)
     parsed, _err = await _deepseek_json_call(
         system=LLM_ROUTER_SYSTEM_PROMPT, user=text, max_tokens=1500,
         temperature=0, label="feishu/route", run_id="",
     )
     if not parsed or not isinstance(parsed, dict):
+        print(f"[feishu/route] LLM returned None or non-dict", flush=True)
         return None
     action = parsed.get("action")
     if action not in KNOWN_ACTIONS:
+        print(f"[feishu/route] reject: unknown action={action!r} "
+              f"(valid: {sorted(KNOWN_ACTIONS)})", flush=True)
         return None
     if action == "run_swarm":
         preset = parsed.get("preset")
         if preset not in KNOWN_PRESETS:
-            print(f"[feishu/route] unknown preset: {preset}", flush=True)
+            print(f"[feishu/route] reject: unknown preset={preset!r}", flush=True)
             return None
         if not parsed.get("target"):
+            print(f"[feishu/route] reject: action=run_swarm but no target "
+                  f"in parsed={parsed!r}", flush=True)
             return None
     if action == "status" and not parsed.get("run_id"):
+        print(f"[feishu/route] reject: action=status but no run_id", flush=True)
         return None
+    print(f"[feishu/route] ok: action={action} preset={parsed.get('preset')} "
+          f"target={parsed.get('target')} gurus={parsed.get('gurus')}", flush=True)
     return parsed
 
 
@@ -1376,7 +1412,7 @@ _EVENT_DEDUP_TTL_SEC = 3600
 # after container restart (in-memory _feishu_pending dict alone is lost on restart).
 def _feishu_meta_path(run_id: str):
     import pathlib
-    return (pathlib.Path(mcp_server.__file__).resolve().parent /
+    return (mcp_server.AGENT_DIR /
             ".swarm" / "runs" / run_id / "feishu_meta.json")
 
 
@@ -1421,7 +1457,7 @@ def _restore_feishu_pending_from_disk() -> int:
     import pathlib
     from src.swarm.store import SwarmStore
     from src.swarm.models import RunStatus
-    runs_dir = pathlib.Path(mcp_server.__file__).resolve().parent / ".swarm" / "runs"
+    runs_dir = mcp_server.AGENT_DIR / ".swarm" / "runs"
     if not runs_dir.exists():
         return 0
     store = SwarmStore(base_dir=runs_dir)
@@ -3056,7 +3092,7 @@ def _feishu_poll_loop():
     from src.swarm.models import RunStatus
     from src.swarm.store import SwarmStore
     import pathlib
-    swarm_dir = pathlib.Path(mcp_server.__file__).resolve().parent / ".swarm" / "runs"
+    swarm_dir = mcp_server.AGENT_DIR / ".swarm" / "runs"
     store = SwarmStore(base_dir=swarm_dir)
 
     loop = asyncio.new_event_loop()
@@ -3164,19 +3200,28 @@ async def feishu_events(request: Request):
 
     # Legacy URL verification (schema v1)
     if body.get("type") == "url_verification":
+        print(f"[feishu/webhook] url_verification from {client_ip}", flush=True)
         return JSONResponse({"challenge": body.get("challenge")})
 
     # Schema v2
     if body.get("schema") == "2.0":
         event_id = header.get("event_id", "")
-        if _is_duplicate_feishu_event(event_id):
-            print(f"[feishu] dedup: dropping duplicate event_id={event_id}", flush=True)
-            return JSONResponse({"code": 0})
         event_type = header.get("event_type", "")
+        print(f"[feishu/webhook] event_type={event_type} event_id={event_id} "
+              f"src={client_ip}", flush=True)
+        if _is_duplicate_feishu_event(event_id):
+            print(f"[feishu/webhook] dedup: drop duplicate event_id={event_id}",
+                  flush=True)
+            return JSONResponse({"code": 0})
         if event_type == "im.message.receive_v1":
             asyncio.create_task(_feishu_handle_message(body))
+        else:
+            print(f"[feishu/webhook] event_type={event_type!r} not handled "
+                  f"(only im.message.receive_v1 dispatched)", flush=True)
         return JSONResponse({"code": 0})
 
+    print(f"[feishu/webhook] unknown body shape, src={client_ip}, "
+          f"keys={list(body.keys())[:10]}", flush=True)
     return JSONResponse({"code": 0})
 
 
@@ -3248,7 +3293,7 @@ def _resolve_latest_run_id(filter_status: str | None = "completed",
     Authz: only sees runs originating from THIS chat or THIS sender's open_id."""
     from src.swarm.store import SwarmStore
     import pathlib
-    swarm_dir = pathlib.Path(mcp_server.__file__).resolve().parent / ".swarm" / "runs"
+    swarm_dir = mcp_server.AGENT_DIR / ".swarm" / "runs"
     try:
         store = SwarmStore(base_dir=swarm_dir)
         runs = store.list_runs() or []
@@ -3297,41 +3342,53 @@ async def _feishu_handle_message(body: dict):
         msg = event.get("message") or {}
         chat_id = msg.get("chat_id")
         if not chat_id:
+            print(f"[feishu/msg] skip: missing chat_id (body keys={list(body.keys())})",
+                  flush=True)
             return
-        # Capture sender's open_id so we can share generated docs with them.
         sender = event.get("sender") or {}
         sender_id = sender.get("sender_id") or {}
         sender_open_id = sender_id.get("open_id") or ""
         chat_type = msg.get("chat_type") or ""  # 'p2p' (DM) or 'group'
-        if msg.get("message_type") != "text":
+        msg_type = msg.get("message_type") or ""
+        print(f"[feishu/msg] received chat={chat_id} type={chat_type} "
+              f"sender={sender_open_id[:12]}.. msg_type={msg_type}", flush=True)
+        if msg_type != "text":
+            print(f"[feishu/msg] reject: msg_type={msg_type} (only text supported)",
+                  flush=True)
             _feishu_send_text(chat_id, "chat_id",
                               "目前只支持文本消息。发 help 看用法。")
             return
         try:
             content = json.loads(msg.get("content") or "{}")
-        except Exception:
+        except Exception as je:
+            print(f"[feishu/msg] content JSON parse failed: {je}", flush=True)
             content = {}
         raw_text = content.get("text", "") or ""
         text = _strip_mentions(raw_text)
+        print(f"[feishu/msg] text(stripped)={text[:120]!r}", flush=True)
         if not text:
+            print(f"[feishu/msg] empty text after strip_mentions, send help", flush=True)
             _feishu_send_text(chat_id, "chat_id", HELP_TEXT)
             return
 
         # ─── routing ───
-        # Highest priority: explicit `preset:xxx <args>` override (deterministic,
-        # zero-latency, doesn't burn LLM tokens for power users).
         explicit_preset, cleaned_text = _parse_explicit_preset(text)
         if explicit_preset:
             target, market = _extract_target(cleaned_text)
+            print(f"[feishu/dispatch] explicit preset={explicit_preset} "
+                  f"target={target} market={market}", flush=True)
             await _fire_swarm(chat_id, explicit_preset, target, market, cleaned_text,
                               sender_open_id=sender_open_id, chat_type=chat_type)
             return
 
-        # Primary path: LLM router. Handles all 8 actions including system commands.
         llm_result = await _llm_route(text)
 
         if llm_result is not None:
             action = llm_result.get("action")
+            print(f"[feishu/dispatch] action={action} "
+                  f"preset={llm_result.get('preset')} "
+                  f"target={llm_result.get('target')} "
+                  f"gurus={llm_result.get('gurus')}", flush=True)
             if action == "run_swarm":
                 # Optional guru override — only honored when LLM router extracted
                 # explicit names; whitelist-filtered downstream in _fire_swarm.
@@ -3398,14 +3455,20 @@ async def _feishu_handle_message(body: dict):
             return
 
         # Fallback when LLM is unavailable: regex ticker + keyword preset classifier.
+        print(f"[feishu/dispatch] LLM router returned None, falling back to regex",
+              flush=True)
         target, market = _extract_target(text)
         if not target:
+            print(f"[feishu/dispatch] regex fallback: no ticker recognized, "
+                  f"text={text[:60]!r}", flush=True)
             _feishu_send_text(
                 chat_id, "chat_id",
                 "没识别出来,试试 SOXL / 1810.HK / 605117 / BTC,或发 help。",
             )
             return
         fallback_preset = _classify_preset(text, FEISHU_DEFAULT_PRESET)
+        print(f"[feishu/dispatch] regex fallback fire: preset={fallback_preset} "
+              f"target={target} market={market}", flush=True)
         await _fire_swarm(chat_id, fallback_preset, target, market, text,
                           sender_open_id=sender_open_id, chat_type=chat_type)
     except Exception as e:
@@ -3485,7 +3548,7 @@ async def _fire_swarm(chat_id: str, preset: str, target: str | None,
     from src.swarm.runtime import SwarmRuntime
     from src.swarm.store import SwarmStore
     import pathlib
-    swarm_dir = pathlib.Path(mcp_server.__file__).resolve().parent / ".swarm" / "runs"
+    swarm_dir = mcp_server.AGENT_DIR / ".swarm" / "runs"
     store = SwarmStore(base_dir=swarm_dir)
     runtime = SwarmRuntime(store=store)
     variables = _build_preset_vars(preset, target, market, raw_text)
@@ -3543,7 +3606,7 @@ async def _feishu_handle_cancel_run(chat_id: str, run_id: str) -> None:
     """Kill a stuck/unwanted run. Mirrors /_debug/purge-run logic."""
     import ctypes, pathlib, shutil
     from src.swarm.store import SwarmStore
-    swarm_dir = pathlib.Path(mcp_server.__file__).resolve().parent / ".swarm" / "runs"
+    swarm_dir = mcp_server.AGENT_DIR / ".swarm" / "runs"
 
     actions: list[str] = []
     # 1. Try the runtime's built-in cancel path (sets the cancel_event).
@@ -3607,7 +3670,7 @@ async def _feishu_handle_list_presets(chat_id: str):
 async def _feishu_handle_status(chat_id: str, run_id: str):
     from src.swarm.store import SwarmStore
     import pathlib
-    swarm_dir = pathlib.Path(mcp_server.__file__).resolve().parent / ".swarm" / "runs"
+    swarm_dir = mcp_server.AGENT_DIR / ".swarm" / "runs"
     store = SwarmStore(base_dir=swarm_dir)
     try:
         run = store.load_run(run_id)
@@ -3646,7 +3709,7 @@ async def _feishu_handle_list_runs(chat_id: str, status_filter: str | None = Non
     群 A 看不到群 B 的 run,私聊看不到他人的 run。"""
     from src.swarm.store import SwarmStore
     import pathlib
-    swarm_dir = pathlib.Path(mcp_server.__file__).resolve().parent / ".swarm" / "runs"
+    swarm_dir = mcp_server.AGENT_DIR / ".swarm" / "runs"
     store = SwarmStore(base_dir=swarm_dir)
     try:
         runs = store.list_runs() or []

@@ -73,6 +73,17 @@ railway logs --service vibe-trading-mcp --build   # build 日志
 | △ | `GURU_VIEW_MAX` | 每次最多几位游资观点（1-3，默认 2） |
 | 🔒 | `ADMIN_AUTH_TOKEN` | `/_debug/*` 运维端点专用凭据,**与 MCP_AUTH_TOKEN 独立**;不设则所有 debug 路由不注册 |
 | 🔒 | `ENABLE_DEBUG_ENDPOINTS` | `true` 才注册 `/_debug/*`(默认 false,生产安全) |
+| 💾 | `STATE_DIR` | Railway Volume 挂载点(如 `/app/data`)。设了 + 挂 Volume → swarm runs + OAuth registry 跨 deploy 持久化 |
+
+## 状态持久化(Railway Volume)
+
+默认 Railway 容器 ephemeral,每次 deploy 重建文件系统 → swarm 已完成的报告 / OAuth 注册的 client / feishu_meta 全部清零。要长期保留:
+
+1. Railway dashboard → service `vibe-trading-mcp` → **Volumes** → **Add Volume**,挂载路径填 `/app/data`(或任意路径)
+2. 同一 service 的 **Variables** 加 `STATE_DIR=/app/data`(和 Volume 路径一致)
+3. 下次 deploy 后生效:启动日志会出现 `[boot] STATE_DIR active: /app/data (swarm runs → /app/data/.swarm/runs)`
+
+不设 `STATE_DIR` 时退化到老行为(写 site-packages ephemeral 目录),每次 deploy 清零。
 
 ## 安全模型
 
