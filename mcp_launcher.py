@@ -1256,49 +1256,76 @@ def _build_summarizer_prompt(template: str) -> str:
 """
 
 
-# ─────────── 游资观点 (小鳄鱼 / xiao-eyu skill) addendum ───────────
+# ─────────── 游资观点 (multi-guru) addendum ───────────
+# 10 位游资 voice，每次分析 LLM 路由选 1-2 个互补的派别生成观点。
+# 模式由 GURU_VIEW_MODE 控制：auto（LLM 路由）/ fixed:name1,name2 / off。
 
-def _load_xiao_eyu_skill() -> str:
-    """Read xiao-eyu/SKILL.md once from the swarm's skills dir.
+GURU_LIST = [
+    "xiao-eyu", "bei-jing-chao-jia", "chen-xiao-qun", "jiu-er-ke-bi",
+    "nie-pan-chong-sheng", "yi-shun-liu-guang", "xiang-cheng-cai-lian-lu",
+    "xiao-rui-rui", "hua-dong-da-dao-dan", "gui-yin",
+]
 
-    Resolves via SkillsLoader so it works both in container (bundled at
-    site-packages/src/skills/) and in local dev. Returns "" if missing —
-    feature degrades silently and addendum is just skipped.
-    """
+# (中文名, 派别) — 卡片/文档/Notion 标题用。
+GURU_META: dict[str, tuple[str, str]] = {
+    "xiao-eyu":                ("小鳄鱼", "理解力派"),
+    "bei-jing-chao-jia":       ("北京炒家", "模式派"),
+    "chen-xiao-qun":           ("陈小群", "龙头信仰派"),
+    "jiu-er-ke-bi":            ("92 科比", "情绪周期派"),
+    "nie-pan-chong-sheng":     ("涅盘重升", "资金流派"),
+    "yi-shun-liu-guang":       ("一瞬流光", "高位接力派"),
+    "xiang-cheng-cai-lian-lu": ("采莲路", "控回撤派"),
+    "xiao-rui-rui":            ("小睿睿", "进攻派"),
+    "hua-dong-da-dao-dan":     ("华东大导弹", "低频狙击派"),
+    "gui-yin":                 ("归因", "资讯派"),
+}
+
+GURU_VIEW_MODE = os.environ.get("GURU_VIEW_MODE", "auto").strip().lower()
+GURU_VIEW_MAX = max(1, min(3, int(os.environ.get("GURU_VIEW_MAX", "2") or "2")))
+
+
+def _extract_guru_profile(skill_md: str) -> str:
+    """Extract the frontmatter description as the routing profile (~300 chars)."""
+    m = re.search(r"^---\n(.+?)\n---", skill_md, re.DOTALL)
+    if not m:
+        return skill_md[:300]
+    fm = m.group(1)
+    # Greedy match of description value until the next top-level YAML key or end.
+    desc_m = re.search(r"description:\s*(.+?)(?=\n[a-zA-Z_]+:\s|\Z)", fm, re.DOTALL)
+    return (desc_m.group(1).strip() if desc_m else "")[:600]
+
+
+def _load_all_guru_skills() -> tuple[dict[str, str], dict[str, str]]:
+    """Returns (profiles_for_routing, full_skill_md_for_voicing)."""
+    profiles: dict[str, str] = {}
+    full: dict[str, str] = {}
     try:
         from src.agent.skills import SkillsLoader
-        skills_dir = SkillsLoader().skills_dir
-        path = os.path.join(str(skills_dir), "xiao-eyu", "SKILL.md")
-        if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8") as fh:
-                return fh.read()
+        skills_dir = str(SkillsLoader().skills_dir)
     except Exception as e:
-        print(f"[xiao-eyu] skill load failed: {e}", flush=True)
-    return ""
+        print(f"[guru] SkillsLoader unavailable: {e}", flush=True)
+        return profiles, full
+    for name in GURU_LIST:
+        path = os.path.join(skills_dir, name, "SKILL.md")
+        if not os.path.isfile(path):
+            print(f"[guru] missing: {name}", flush=True)
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                text = fh.read()
+            full[name] = text
+            profiles[name] = _extract_guru_profile(text)
+        except Exception as e:
+            print(f"[guru] read {name} failed: {e}", flush=True)
+    return profiles, full
 
 
-_XIAO_EYU_SKILL_TEXT = _load_xiao_eyu_skill()
-if _XIAO_EYU_SKILL_TEXT:
-    print(f"[xiao-eyu] skill loaded ({len(_XIAO_EYU_SKILL_TEXT)} chars)", flush=True)
-else:
-    print("[xiao-eyu] skill NOT loaded — 游资观点 addendum disabled", flush=True)
+_GURU_PROFILES, _GURU_SKILLS = _load_all_guru_skills()
+print(f"[guru] loaded {len(_GURU_SKILLS)}/{len(GURU_LIST)} gurus "
+      f"(mode={GURU_VIEW_MODE}, max={GURU_VIEW_MAX})", flush=True)
 
 
-async def _generate_youzi_view(full_report: str, summary: dict,
-                                preset: str, run_id: str) -> str | None:
-    """Generate a 3-5 line A股 hot-money trader perspective addendum.
-
-    Only fires for stock_decision template presets — macro/research outputs
-    don't map cleanly to 游资 short-term framework. Returns markdown string
-    or None on failure / not applicable.
-    """
-    if not _XIAO_EYU_SKILL_TEXT:
-        return None
-    if PRESET_TEMPLATE.get(preset, "stock_decision") != "stock_decision":
-        return None
-    if not full_report:
-        return None
-
+def _get_llm_creds() -> tuple[str, str, str]:
     api_key = (os.environ.get("DEEPSEEK_API_KEY")
                or os.environ.get("OPENROUTER_API_KEY")
                or os.environ.get("OPENAI_API_KEY") or "").strip()
@@ -1307,34 +1334,130 @@ async def _generate_youzi_view(full_report: str, summary: dict,
                 or os.environ.get("OPENAI_BASE_URL")
                 or "https://api.deepseek.com/v1").rstrip("/")
     model = os.environ.get("LANGCHAIN_MODEL_NAME", "deepseek-v4-pro").strip()
+    return api_key, base_url, model
+
+
+async def _route_gurus(summary: dict, full_report: str, run_id: str) -> list[str]:
+    """LLM picks 1-2 most relevant gurus. Whitelist-validated.
+
+    Returns [] when not applicable (non-A股短线场景) OR on routing failure
+    (caller decides whether to fallback).
+    """
+    # Fixed mode bypasses LLM.
+    if GURU_VIEW_MODE.startswith("fixed:"):
+        spec = GURU_VIEW_MODE[len("fixed:"):].strip()
+        return [g.strip() for g in spec.split(",")
+                if g.strip() in _GURU_PROFILES][:GURU_VIEW_MAX]
+
+    if not _GURU_PROFILES:
+        return []
+
+    api_key, base_url, model = _get_llm_creds()
+    if not api_key:
+        return []
+
+    profile_blocks = "\n\n".join(
+        f"### {name} ({GURU_META[name][0]} · {GURU_META[name][1]})\n{prof}"
+        for name, prof in _GURU_PROFILES.items()
+    )
+    system = (
+        "你是 A 股短线游资视角分发器。下面是 10 位游资的简短画像。"
+        f"读用户给的个股分析报告，从这 10 位里选 1-{GURU_VIEW_MAX} 位**最相关的互补**游资。\n\n"
+        "硬规则：\n"
+        f"- 选 1 位还是多位看报告内容：格局明确就 1 位即可，复杂(主线+龙头/首板+控回撤)再选 2 位，最多 {GURU_VIEW_MAX} 位\n"
+        "- 选多位时必须是**不同派别**，互补视角，不要两个同派\n"
+        "- 如果报告不是 A 股短线场景 (美股/港股/加密/期货/宏观/纯长线)，返回空 selected: []\n"
+        "- 只返回 JSON，不要其他文字：\n"
+        '  {"selected": ["name1", "name2"], "reason": "为啥选他们 + 互补点"}\n'
+        f"- name 严格只能是这 10 个之一：{', '.join(GURU_LIST)}\n\n"
+        + profile_blocks
+    )
+    headline = summary.get("headline") or summary.get("title") or ""
+    badge = summary.get("badge") or ""
+    user_msg = (
+        f"主结论: {badge} — {headline}\n\n"
+        f"--- 报告片段(截前 4000 字) ---\n{(full_report or '')[:4000]}"
+    )
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10, read=60, write=15, pool=5),
+        ) as c:
+            r = await c.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}",
+                         "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    "response_format": {"type": "json_object"},
+                    "max_tokens": 1500,
+                    "temperature": 0.3,
+                },
+            )
+            if r.status_code != 200:
+                print(f"[guru/route] HTTP {r.status_code} run={run_id}: "
+                      f"{r.text[:200]}", flush=True)
+                return []
+            d = r.json()
+            msg = d["choices"][0]["message"]
+            content = (msg.get("content") or msg.get("reasoning_content") or "").strip()
+            m = re.search(r"\{[\s\S]*\}", content)
+            if not m:
+                print(f"[guru/route] no JSON in response run={run_id}", flush=True)
+                return []
+            parsed = json.loads(m.group(0))
+            selected_raw = parsed.get("selected") or []
+            # Whitelist + dedupe + cap.
+            valid: list[str] = []
+            for name in selected_raw:
+                if isinstance(name, str) and name in _GURU_SKILLS and name not in valid:
+                    valid.append(name)
+                if len(valid) >= GURU_VIEW_MAX:
+                    break
+            print(f"[guru/route] run={run_id} selected={valid} "
+                  f"reason={parsed.get('reason','')[:120]}", flush=True)
+            return valid
+    except Exception as e:
+        print(f"[guru/route] exception run={run_id}: {type(e).__name__}: {e}",
+              flush=True)
+        return []
+
+
+async def _generate_single_guru_view(guru: str, full_report: str, summary: dict,
+                                      run_id: str) -> str | None:
+    """Generate one guru's view using their full SKILL.md as voice."""
+    skill_text = _GURU_SKILLS.get(guru)
+    if not skill_text:
+        return None
+    display_name, school = GURU_META.get(guru, (guru, "未知派别"))
+
+    api_key, base_url, model = _get_llm_creds()
     if not api_key:
         return None
 
     system_prompt = (
-        _XIAO_EYU_SKILL_TEXT.strip()
+        skill_text.strip()
         + "\n\n----\n"
-        + "你现在是 A 股游资『小鳄鱼』本人。读下面这份个股分析报告，按你的理解力派视角"
-        + "给出 3-5 句锐评。要点：\n"
-        + "1. 主线判断：标的属于当前主流还是支线/无主线\n"
-        + "2. 节奏定位：启动 / 主升 / 首阴 / 调整 / 转强\n"
-        + "3. 操作建议：接力 / 低吸 / 打板 / 观望 / 离场，以及触发条件\n"
-        + "4. 一句风险提示（资金切换、龙头分歧、情绪退潮等）\n\n"
-        + "硬规则：\n"
-        + "- 全中文，口语化游资风格（直接、不绕、有判断）\n"
-        + "- 不复述报告原文，只给『小鳄鱼会怎么看』\n"
-        + "- 如果标的不是 A 股短线品种（美股/港股/加密/期货/宏观），返回单行：『不适用』\n"
-        + "- 不要 JSON，不要 markdown 列表标记，直接输出 3-5 行短句\n"
-        + "- 总长度 200-450 字"
+        + f"你现在是 A 股游资『{display_name}』本人(派别: {school})。"
+        + "读下面这份个股分析报告，严格按你的判断框架给 3-5 句锐评。要点:\n"
+        + "1. 主线判断 / 个股定位 / 节奏阶段 / 操作建议 / 风险提示\n"
+        + "2. 操作建议要符合你这派的特色 (模式派→首板战法，控回撤派→4 点底线，进攻派→敢上重仓，等)\n\n"
+        + "硬规则:\n"
+        + "- 全中文，口语化游资风格 (直接、不绕)\n"
+        + "- 不复述报告原文，只给『你会怎么看』\n"
+        + "- 不要 markdown 列表或 JSON，直接输出 3-5 行短句\n"
+        + "- 总长度 180-400 字"
     )
-
     headline = summary.get("headline") or summary.get("title") or ""
     badge = summary.get("badge") or ""
     user_msg = (
-        f"preset: {preset}\n"
         f"主报告结论: {badge} — {headline}\n\n"
-        f"--- 完整报告（截前 8000 字） ---\n{full_report[:8000]}"
+        f"--- 完整报告(截前 8000 字) ---\n{(full_report or '')[:8000]}"
     )
-
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10, read=60, write=15, pool=5),
@@ -1354,19 +1477,51 @@ async def _generate_youzi_view(full_report: str, summary: dict,
                 },
             )
             if r.status_code != 200:
-                print(f"[xiao-eyu] HTTP {r.status_code} run={run_id}: "
+                print(f"[guru/{guru}] HTTP {r.status_code} run={run_id}: "
                       f"{r.text[:200]}", flush=True)
                 return None
             d = r.json()
             msg = d["choices"][0]["message"]
             text = (msg.get("content") or msg.get("reasoning_content") or "").strip()
-            if not text or text == "不适用" or text.startswith("不适用"):
+            if not text or text.startswith("不适用"):
                 return None
             return text
     except Exception as e:
-        print(f"[xiao-eyu] exception run={run_id}: {type(e).__name__}: {e}",
+        print(f"[guru/{guru}] exception run={run_id}: {type(e).__name__}: {e}",
               flush=True)
         return None
+
+
+async def _generate_youzi_views(full_report: str, summary: dict,
+                                 preset: str, run_id: str) -> list[dict]:
+    """Pick 1-2 gurus via LLM router, generate each voice in parallel.
+
+    Returns list of {"guru","display_name","school","text"} (possibly empty).
+    """
+    if GURU_VIEW_MODE == "off":
+        return []
+    if PRESET_TEMPLATE.get(preset, "stock_decision") != "stock_decision":
+        return []
+    if not full_report or not _GURU_SKILLS:
+        return []
+
+    selected = await _route_gurus(summary, full_report, run_id)
+    if not selected:
+        return []
+
+    results = await asyncio.gather(
+        *[_generate_single_guru_view(g, full_report, summary, run_id) for g in selected],
+        return_exceptions=True,
+    )
+    views: list[dict] = []
+    for guru, view in zip(selected, results):
+        if isinstance(view, str) and view:
+            display, school = GURU_META.get(guru, (guru, "未知派别"))
+            views.append({"guru": guru, "display_name": display,
+                          "school": school, "text": view})
+    print(f"[guru] run={run_id} produced {len(views)} views: "
+          f"{[v['guru'] for v in views]}", flush=True)
+    return views
 
 
 async def _summarize_report(run) -> dict | None:
@@ -1578,15 +1733,23 @@ def _build_feishu_card(summary: dict, run_id: str,
         elements.append(_bullet_block(aoc.get("label", "📋 后续"),
                                       aoc.get("items") or []))
 
-    # 游资观点 (xiao-eyu / 小鳄鱼 视角) — appended below main analysis for stock_decision.
-    youzi = (summary.get("youzi_view") or "").strip()
-    if youzi:
+    # 游资观点 (multi-guru) — LLM 自选 1-2 位互补游资,仅 stock_decision preset.
+    views = summary.get("youzi_views") or []
+    if views:
         elements.append({"tag": "hr"})
         elements.append({
             "tag": "div",
             "text": {"tag": "lark_md",
-                     "content": f"**🐊 游资观点 · 小鳄鱼视角**\n{youzi}"},
+                     "content": f"**🐊 游资观点 · LLM 自选 {len(views)} 位**"},
         })
+        for v in views:
+            if not isinstance(v, dict) or not v.get("text"):
+                continue
+            elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md",
+                         "content": f"**{v.get('display_name','游资')} · {v.get('school','')}**\n{v['text']}"},
+            })
 
     # Footer: full-report links (Feishu doc + Notion) + run id
     actions = []
@@ -2016,14 +2179,20 @@ def _feishu_create_doc_from_report(summary: dict, full_report: str,
         for item in (aoc.get("items") or [])[:8]:
             blocks.append(_feishu_text_block(item, "bullet"))
 
-    # 游资观点 (xiao-eyu / 小鳄鱼) — between main summary and raw report.
-    youzi = (summary.get("youzi_view") or "").strip()
-    if youzi:
+    # 游资观点 (multi-guru) — between main summary and raw report.
+    views = summary.get("youzi_views") or []
+    if views:
         blocks.append({"block_type": 22, "divider": {}})
-        blocks.append(_feishu_text_block("🐊 游资观点 · 小鳄鱼视角", "heading2"))
-        for line in youzi.split("\n"):
-            if line.strip():
-                blocks.append(_feishu_text_block(line.strip(), "text"))
+        blocks.append(_feishu_text_block(
+            f"🐊 游资观点 · LLM 自选 {len(views)} 位", "heading2"))
+        for v in views:
+            if not isinstance(v, dict) or not v.get("text"):
+                continue
+            title = f"{v.get('display_name','游资')} · {v.get('school','')}"
+            blocks.append(_feishu_text_block(title, "heading3"))
+            for line in v["text"].split("\n"):
+                if line.strip():
+                    blocks.append(_feishu_text_block(line.strip(), "text"))
 
     blocks.append({"block_type": 22, "divider": {}})
     blocks.append(_feishu_text_block("完整原始报告", "heading2"))
@@ -2217,24 +2386,33 @@ async def _notion_create_page(summary: dict, full_report: str, run_id: str,
                                                        "text": {"content": f"{k}: {v}"}}]},
             })
 
-    # 游资观点 (xiao-eyu / 小鳄鱼) — between main summary and raw report.
-    youzi = (summary.get("youzi_view") or "").strip()
-    if youzi:
+    # 游资观点 (multi-guru) — between main summary and raw report.
+    views = summary.get("youzi_views") or []
+    if views:
         body_blocks.append({"object": "block", "type": "divider", "divider": {}})
         body_blocks.append({
             "object": "block", "type": "heading_2",
             "heading_2": {"rich_text": [{"type": "text",
-                                          "text": {"content": "🐊 游资观点 · 小鳄鱼视角"}}]},
+                                          "text": {"content": f"🐊 游资观点 · LLM 自选 {len(views)} 位"}}]},
         })
-        for line in youzi.split("\n"):
-            line = line.strip()
-            if not line:
+        for v in views:
+            if not isinstance(v, dict) or not v.get("text"):
                 continue
+            title = f"{v.get('display_name','游资')} · {v.get('school','')}"
             body_blocks.append({
-                "object": "block", "type": "paragraph",
-                "paragraph": {"rich_text": [{"type": "text",
-                                              "text": {"content": line[:1900]}}]},
+                "object": "block", "type": "heading_3",
+                "heading_3": {"rich_text": [{"type": "text",
+                                              "text": {"content": title}}]},
             })
+            for line in v["text"].split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                body_blocks.append({
+                    "object": "block", "type": "paragraph",
+                    "paragraph": {"rich_text": [{"type": "text",
+                                                  "text": {"content": line[:1900]}}]},
+                })
 
     body_blocks.append({"object": "block", "type": "divider", "divider": {}})
     body_blocks.append({
@@ -2350,15 +2528,15 @@ async def _publish_terminal_run(run, info: dict) -> None:
             print(f"[publish] summary-fail send err {run_id}: {e}", flush=True)
         return
 
-    # 1b. 游资观点 (xiao-eyu / 小鳄鱼 视角) — only for stock_decision presets.
+    # 1b. 游资观点 (multi-guru) — LLM 路由选 1-2 位互补游资,仅 stock_decision preset.
     try:
-        youzi = await _generate_youzi_view(full_report, summary, preset, run_id)
-        if youzi:
-            summary["youzi_view"] = youzi
-            print(f"[publish] youzi view ok {run_id} ({len(youzi)} chars)",
-                  flush=True)
+        views = await _generate_youzi_views(full_report, summary, preset, run_id)
+        if views:
+            summary["youzi_views"] = views
+            print(f"[publish] guru views ok {run_id}: "
+                  f"{[v['guru'] for v in views]}", flush=True)
     except Exception as e:
-        print(f"[publish] youzi exception {run_id}: {e}", flush=True)
+        print(f"[publish] guru exception {run_id}: {e}", flush=True)
 
     # 2. Notion sync (independent of Feishu success)
     notion_url: str | None = None
