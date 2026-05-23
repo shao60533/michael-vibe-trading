@@ -43,9 +43,11 @@ RUN useradd --create-home --shell /usr/sbin/nologin vibe \
     && echo "SkillsLoader.skills_dir = $SKILLS_DIR" \
     && mkdir -p "$SKILLS_DIR" \
     && cp -r /tmp/extra_skills/* "$SKILLS_DIR/" \
-    && ls -la "$SKILLS_DIR/a-stock-data/SKILL.md" \
-              "$SKILLS_DIR/global-stock-data/SKILL.md" \
-              "$SKILLS_DIR/xiao-eyu/SKILL.md" \
+    && for d in /tmp/extra_skills/*/; do \
+         name=$(basename "$d"); \
+         test -f "$SKILLS_DIR/$name/SKILL.md" || { echo "MISSING: $name/SKILL.md"; exit 1; }; \
+         echo "✓ skill installed: $name"; \
+       done \
     && chown -R vibe:vibe /app
 USER vibe
 

@@ -17,20 +17,19 @@ jobs:
           python-version: '3.11'
       - name: Compile mcp_launcher.py
         run: python -m py_compile mcp_launcher.py
-      - name: Verify Dockerfile has all skill dirs declared
+      - name: Verify every skill has SKILL.md
         run: |
-          # Ensure every skills/<name>/ has a corresponding SKILL.md sanity check
-          # in the Dockerfile so build catches missing files early.
+          # Dockerfile loops over /tmp/extra_skills/*/ at build time and fails if
+          # any subdir lacks SKILL.md, so we only need to mirror that check here.
+          missing=0
           for skill in skills/*/; do
             name=$(basename "$skill")
             if [ ! -f "${skill}SKILL.md" ]; then
               echo "::error::skills/$name/ has no SKILL.md"
-              exit 1
-            fi
-            if ! grep -q "$name/SKILL.md" Dockerfile; then
-              echo "::warning::skills/$name not referenced in Dockerfile sanity ls"
+              missing=1
             fi
           done
+          exit $missing
       - name: Verify required env vars documented
         run: |
           # Anything mcp_launcher.py reads via os.environ should appear in .env.example
