@@ -41,9 +41,11 @@ gh pr create --base main --fill         # 或在 GitHub 网页发 PR
 - [ ] `python -m py_compile mcp_launcher.py` 通过(CI 会再跑一次)
 - [ ] 没把密钥/token 写进代码或测试文件
 - [ ] 没把 `.env` 文件 commit 进去
-- [ ] 新增环境变量同步更新到 `.env.example`
-- [ ] 新增 skill 同步更新 `Dockerfile` 里的 `ls -la $SKILLS_DIR/...` 校验行
+- [ ] 新增环境变量同步更新到 `.env.example`(CI 会自动校验)
+- [ ] 新增 skill 只要扔进 `skills/<name>/SKILL.md` 即可,Dockerfile 已是 for-loop 自动装(CI 校验每个 skill 有 SKILL.md)
 - [ ] 改了 publish 路径(card / doc / notion)的话,三个地方都要同步改
+- [ ] 改了 `_publish_terminal_run` 流程 / 新增飞书指令,在 README 「飞书使用指北」表格里加一行
+- [ ] 用户可感知的变更(新功能 / 行为变更 / bug 修复)在 `CHANGELOG.md` 的 `[Unreleased]` 段加一条
 - [ ] 注释说明 *why* 而不是 *what*(代码本身能讲清楚 what)
 
 ## 代码风格

@@ -4,7 +4,8 @@ A 股 / 美港股 / 加密 多市场 AI 投研服务。基于 [vibe-trading-ai](
 
 - **MCP over SSE** — 供 Claude Desktop / Code / 移动端 Custom Connector 使用，支持静态 Bearer + OAuth 2.1 PKCE
 - **飞书 Bot Webhook** — 自然语言对话触发分析，结果以飞书互动卡片 + 飞书云文档 + Notion 三处同步推送
-- **数据 Skill** — `a-stock-data`（A 股 28 个端点）、`global-stock-data`（美港股 18 个端点）、`xiao-eyu`（A 股游资视角锐评）
+- **数据 Skill** — `a-stock-data`（A 股 28 端点）、`global-stock-data`（美港股 18 端点）
+- **游资观点 Skill** — 10 位 A 股新生代游资 voice，分析 A 股个股时 LLM 自动选 1-2 位互补派别给观点；也可在飞书指令里指定（"用陈小群看 茅台"）
 
 ## 架构
 
@@ -67,20 +68,84 @@ railway logs --service vibe-trading-mcp --build   # build 日志
 | △ | `LARK_APP_ID` / `LARK_APP_SECRET` | 飞书 bot（不填则 webhook 不启用） |
 | △ | `NOTION_API_KEY` + (`NOTION_DATABASE_ID` 或 `NOTION_PARENT_PAGE_ID`) | Notion 同步（不填则跳过） |
 | △ | `FEISHU_VERIFICATION_TOKEN` | 飞书事件校验 token（强烈建议） |
+| △ | `GURU_VIEW_MODE` | `auto`（默认，LLM 路由选游资）/ `fixed:n1,n2`（固定）/ `off`（关闭） |
+| △ | `GURU_VIEW_MAX` | 每次最多几位游资观点（1-3，默认 2） |
+
+## 飞书使用指北
+
+bot 用 LLM router 解析自然语言指令，常用形式：
+
+| 指令 | 行为 |
+|------|------|
+| `分析 茅台` / `看下 NVDA` | 默认 `investment_committee` preset |
+| `茅台技术面` / `英伟达 K 线` | 自动切 `technical_analysis_panel` |
+| `茅台财报` / `分析下苹果季报` | 切 `earnings_research_desk` |
+| `半导体板块` / `光模块怎么样` | 切 `sector_rotation_team` |
+| `BTC 链上活跃度` | 切 `crypto_research_lab` |
+| `用陈小群看 茅台` | A 股分析 + 强制只用陈小群一位游资 |
+| `分析 002594，用北京炒家和小鳄鱼` | 强制用这两位游资 |
+| `控回撤派看 隆基` | 派别名 LLM 自动映射成 xiang-cheng-cai-lian-lu |
+| `最近跑过哪些分析` / `失败的 run` | 列历史 |
+| `查一下 latest` / `查一下 swarm-xxx` | 拉报告 |
+| `取消 swarm-xxx` / `把当前在跑的干掉` | 终止 |
+| `怎么用` / `有哪些 preset` | help |
+
+完整支持的 28 个 preset 见 [`mcp_launcher.py`](mcp_launcher.py) 顶部 `KNOWN_PRESETS` 集合，或在飞书发 `presets`。
+
+## 游资观点 (10 voice multi-guru)
+
+A 股 `stock_decision` 类 preset 的报告下方会附加「🐊 游资观点」段落，由 1-2 位互补派别的游资从他们的视角给 3-5 句锐评：
+
+| skill 名 | 中文 / 别名 | 派别 |
+|---|---|---|
+| `xiao-eyu` | 小鳄鱼 | 理解力派 |
+| `bei-jing-chao-jia` | 北京炒家 | 模式派 |
+| `chen-xiao-qun` | 陈小群、群神 | 龙头信仰派 |
+| `jiu-er-ke-bi` | 92 科比 | 情绪周期派 |
+| `nie-pan-chong-sheng` | 涅盘重升、升大 | 资金流派 |
+| `yi-shun-liu-guang` | 一瞬流光、光神 | 高位接力派 |
+| `xiang-cheng-cai-lian-lu` | 采莲路、川哥 | 控回撤派 |
+| `xiao-rui-rui` | 小睿睿、睿神 | 进攻派 |
+| `hua-dong-da-dao-dan` | 华东大导弹 | 低频狙击派 |
+| `gui-yin` | 归因 | 资讯派 |
+
+**路由逻辑**（mcp_launcher.py 的 `_route_gurus` + `_generate_single_guru_view`）：
+
+1. 用户没指定 → LLM 看 10 位画像 + 报告片段，选 1-2 位互补派别返回 JSON
+2. 用户指定 → 白名单校验 + cap `GURU_VIEW_MAX`，跳过路由
+3. 非 A 股短线场景（美股/港股/加密/宏观）→ 路由返回空，不附加
+4. 渲染：飞书卡 / 飞书 docx / Notion 三处都用同一份 voice，每位单独子段
+
+## 部署可靠性
+
+- **健康检查**：`/healthz` 返回 200 即视为存活
+- **优雅重启**：容器收 SIGTERM（Railway 部署 / 重启）时，`_lifespan` 的 finally 阶段会扫所有 in-flight `_feishu_pending`，给每个原 chat 发「⚠️ 服务部署重启，本次分析被中断，请重新发送原指令」。20s 超时保护，30s 内必须 exit
+- **磁盘易失**：Railway 不挂 Volume 时容器文件系统是 ephemeral，`/usr/local/.../mcp_server/.swarm/runs/` 每次 deploy 都会重建。**部署时进行中的 swarm 分析会丢失**（线程死 + 状态盘擦），用户需重发指令。下一步要加 Railway Volume 保留 run 历史
+- **重启恢复**：`_restore_feishu_pending_from_disk()` 在 lifespan startup 阶段扫盘上 `feishu_meta.json`，把进度恢复到 in-memory dict。如果上次 SIGTERM 前 run 已 completed 但还没 publish，重启后会补推
 
 ## 文件布局
 
 ```
 .
-├── Dockerfile              # Python 3.11 + vibe-trading-ai + mootdx (--no-deps) + pytdx
-├── mcp_launcher.py         # 主入口：SSE + OAuth + Feishu webhook + Notion + xiao-eyu
-├── railway.json            # Railway build config (DOCKERFILE, healthcheck /healthz)
+├── Dockerfile               # Python 3.11 + vibe-trading-ai + mootdx (--no-deps) + pytdx
+├── mcp_launcher.py          # 主入口：SSE + OAuth + Feishu webhook + Notion + multi-guru
+├── railway.json             # Railway build config (DOCKERFILE, healthcheck /healthz)
 ├── skills/
-│   ├── a-stock-data/       # A 股 28 端点（mootdx + 腾讯 + 东财 + 同花顺 + 巨潮 + ...）
-│   ├── global-stock-data/  # 美港股 18 端点（新浪 + 腾讯 + 东财 + Yahoo + SEC）
-│   └── xiao-eyu/           # A 股游资『小鳄鱼』视角，stock_decision preset 自动附加
-├── .env.example            # 环境变量模板（必填 / 选填均列出）
-└── .github/workflows/ci.yml # PR + push 时跑 Python 语法检查
+│   ├── a-stock-data/        # A 股 28 端点（mootdx + 腾讯 + 东财 + 同花顺 + 巨潮 + ...）
+│   ├── global-stock-data/   # 美港股 18 端点（新浪 + 腾讯 + 东财 + Yahoo + SEC）
+│   ├── xiao-eyu/            # 小鳄鱼（理解力派，通用）
+│   ├── bei-jing-chao-jia/   # 北京炒家（模式派）
+│   ├── chen-xiao-qun/       # 陈小群（龙头信仰派）
+│   ├── jiu-er-ke-bi/        # 92 科比（情绪周期派）
+│   ├── nie-pan-chong-sheng/ # 涅盘重升（资金流派）
+│   ├── yi-shun-liu-guang/   # 一瞬流光（高位接力派）
+│   ├── xiang-cheng-cai-lian-lu/ # 采莲路（控回撤派）
+│   ├── xiao-rui-rui/        # 小睿睿（进攻派）
+│   ├── hua-dong-da-dao-dan/ # 华东大导弹（低频狙击派）
+│   └── gui-yin/             # 归因（资讯派）
+├── .env.example             # 环境变量模板（必填 / 选填均列出）
+├── CHANGELOG.md             # 变更历史（按版本/日期）
+└── .github/workflows/ci.yml # PR + push 时跑 4 项检查（syntax / skill / env / 文档同步）
 ```
 
 ## 上游引擎 (vibe-trading-ai)
@@ -129,6 +194,7 @@ python mcp_launcher.py
 
 - `main` — 受保护，每次 push 触发 Railway 部署。**不要直接 push**，走 PR
 - 功能分支 — `feat/xxx` / `fix/xxx` / `chore/xxx`
+- 每次有用户感知的变更，更新 [`CHANGELOG.md`](CHANGELOG.md) 的 `[Unreleased]` 段
 - 详细规范见 [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## License
