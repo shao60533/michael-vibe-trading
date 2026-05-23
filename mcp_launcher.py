@@ -49,48 +49,18 @@ from typing import Any
 from urllib.parse import urlencode
 
 
-# ─────────── httpx Client read-timeout cap (60s) ───────────
-# Stalled LLM streaming responses can wedge worker threads indefinitely on
-# half-dead TCP sockets. Cap every httpx.Client's read timeout at 60s so a
-# silent stream raises ReadTimeout in bounded time. Applied BEFORE importing
-# anything that constructs httpx clients.
 import httpx
 
-_READ_CAP = 60.0
-_CONNECT_CAP = 15.0
-_WRITE_CAP = 15.0
-_POOL_CAP = 5.0
-
-
-def _capped_timeout(orig):
-    if orig is None:
-        return httpx.Timeout(connect=_CONNECT_CAP, read=_READ_CAP,
-                             write=_WRITE_CAP, pool=_POOL_CAP)
-    if isinstance(orig, (int, float)):
-        v = float(orig)
-        return httpx.Timeout(connect=min(v, _CONNECT_CAP), read=min(v, _READ_CAP),
-                             write=min(v, _WRITE_CAP), pool=min(v, _POOL_CAP))
-    if isinstance(orig, httpx.Timeout):
-        def cap(value, lim):
-            return lim if value is None else min(value, lim)
-        return httpx.Timeout(connect=cap(orig.connect, _CONNECT_CAP),
-                             read=cap(orig.read, _READ_CAP),
-                             write=cap(orig.write, _WRITE_CAP),
-                             pool=cap(orig.pool, _POOL_CAP))
-    return orig
-
-
-_orig_httpx_client_init = httpx.Client.__init__
-def _httpx_client_init_capped(self, *args, **kwargs):
-    kwargs["timeout"] = _capped_timeout(kwargs.get("timeout"))
-    return _orig_httpx_client_init(self, *args, **kwargs)
-httpx.Client.__init__ = _httpx_client_init_capped
-
-_orig_httpx_async_client_init = httpx.AsyncClient.__init__
-def _httpx_async_client_init_capped(self, *args, **kwargs):
-    kwargs["timeout"] = _capped_timeout(kwargs.get("timeout"))
-    return _orig_httpx_async_client_init(self, *args, **kwargs)
-httpx.AsyncClient.__init__ = _httpx_async_client_init_capped
+# 历史背景:之前对 httpx.Client / AsyncClient 做过全局 monkey patch,把所有
+# client 的 read timeout 强制 cap 到 60s,目的是防 LLM 流式调用半死 socket
+# 拖死 worker 线程。
+# 副作用:_deepseek_json_call 明确想用 read=90 给 DeepSeek-v4-pro reasoning
+# model 留够时间,被 cap 成 60s 后偶发 ReadTimeout(见 CHANGELOG 0.2.x)。
+#
+# 决定:移除全局 monkey patch,改为「每个 httpx.Client(...) 调用点显式声明
+# timeout」(已 audit:7 处调用全都带 timeout 参数)。
+# 同时在 lifespan startup 加 self-test 断言一个 read=90 的 AsyncClient
+# 真实拿到的就是 90,不是被某个 import 副作用悄悄改的。
 
 
 # Now safe to import mcp_server (which creates FastMCP + lazy ChatLLM clients)
@@ -111,6 +81,16 @@ if not EXPECTED_TOKEN:
     print("FATAL: MCP_AUTH_TOKEN env var is required", file=sys.stderr)
     sys.exit(2)
 
+# 与 MCP_AUTH_TOKEN 解耦的管理员凭据,专用于 /_debug/* 端点。
+# 不设值时所有 /_debug/* 路由不注册(生产默认安全行为)。
+ADMIN_AUTH_TOKEN = os.environ.get("ADMIN_AUTH_TOKEN", "").strip()
+ENABLE_DEBUG_ENDPOINTS = (os.environ.get("ENABLE_DEBUG_ENDPOINTS", "").strip().lower()
+                          in ("1", "true", "yes", "on"))
+DEBUG_ENDPOINTS_ACTIVE = ENABLE_DEBUG_ENDPOINTS and bool(ADMIN_AUTH_TOKEN)
+if ENABLE_DEBUG_ENDPOINTS and not ADMIN_AUTH_TOKEN:
+    print("WARN: ENABLE_DEBUG_ENDPOINTS=true 但 ADMIN_AUTH_TOKEN 未设置,"
+          "/_debug/* 路由不会注册(防止裸跑泄露)", file=sys.stderr)
+
 PORT = int(os.environ.get("PORT", "8000"))
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 
@@ -119,10 +99,29 @@ AUTH_CODE_TTL = 300
 ACCESS_TOKEN_TTL = 3600
 REFRESH_TOKEN_TTL = 30 * 86400
 
+# OAuth dynamic client registration (DCR) — 服务端保存 client_id 及其
+# redirect_uris allowlist。为了简化 Railway 重启场景,落到 /tmp 文件;
+# 容器重启后已注册的 client 可恢复(但 MCP 客户端 token 失效时本来就要重新走
+# DCR + authorize,所以丢失也只是给用户多一次登录,不会破坏安全模型)。
+_OAUTH_CLIENTS_PATH = "/tmp/oauth_clients.json"
+_oauth_clients: dict[str, dict] = {}
+_oauth_clients_lock = threading.Lock()
+
+# OAuth 一次性 authorization code 服务端存储。code 是不可猜测的 random,
+# 不再用 self-signed JWT(JWT 可被重放,只能靠过期窗口拦,弱于真一次性 code)。
+_oauth_codes: dict[str, dict] = {}
+_oauth_codes_lock = threading.Lock()
+
 # Feishu integration
 LARK_APP_ID = os.environ.get("LARK_APP_ID", "").strip()
 LARK_APP_SECRET = os.environ.get("LARK_APP_SECRET", "").strip()
 FEISHU_VERIFICATION_TOKEN = os.environ.get("FEISHU_VERIFICATION_TOKEN", "").strip()
+# 可选:飞书事件加密 key (AES,启用「加密事件」后才需要)。
+# 与 FEISHU_VERIFICATION_TOKEN 任一即可作为身份证据。
+FEISHU_ENCRYPT_KEY = os.environ.get("FEISHU_ENCRYPT_KEY", "").strip()
+# webhook 安全限制
+FEISHU_WEBHOOK_MAX_BYTES = int(os.environ.get("FEISHU_WEBHOOK_MAX_BYTES", "65536"))
+FEISHU_WEBHOOK_RATE_LIMIT = int(os.environ.get("FEISHU_WEBHOOK_RATE_LIMIT", "30"))
 FEISHU_DEFAULT_PRESET = os.environ.get("FEISHU_DEFAULT_PRESET", "investment_committee").strip()
 # Link-share permission for every docx the bot creates. Default tenant_readable
 # so group members can open the link without applying for permission.
@@ -134,7 +133,23 @@ FEISHU_DOC_SHARE_ENTITY = os.environ.get("FEISHU_DOC_SHARE_ENTITY",
 # 这条路绕开「需要 drive:drive 才能改链接共享」的难题。
 # 前提:文件夹所有者必须在飞书把这个文件夹「分享」给 bot 并给「可编辑」权限。
 FEISHU_DRIVE_FOLDER_TOKEN = os.environ.get("FEISHU_DRIVE_FOLDER_TOKEN", "").strip()
-FEISHU_ENABLED = bool(LARK_APP_ID and LARK_APP_SECRET)
+
+# Feishu webhook 强制要求 verification token 或 encrypt key,否则 /feishu/events
+# 不注册路由(防止任意公网 POST 触发 swarm 跑分析)。
+_FEISHU_HAS_SECRET = bool(FEISHU_VERIFICATION_TOKEN or FEISHU_ENCRYPT_KEY)
+FEISHU_ENABLED = bool(LARK_APP_ID and LARK_APP_SECRET and _FEISHU_HAS_SECRET)
+if LARK_APP_ID and LARK_APP_SECRET and not _FEISHU_HAS_SECRET:
+    print("WARN: LARK_APP_ID/SECRET 已设置但 FEISHU_VERIFICATION_TOKEN 和 "
+          "FEISHU_ENCRYPT_KEY 都未设置 — /feishu/events 不会注册(防裸跑)。"
+          "建议:在飞书开放平台「事件订阅」页拷贝 Verification Token 到 env。",
+          file=sys.stderr)
+
+# Link-share entity allowlist — debug 端点改文档权限时只能选这几个值。
+FEISHU_LINK_SHARE_ENTITIES = frozenset({
+    "tenant_readable", "tenant_editable",
+    "anyone_readable", "anyone_editable",
+    "closed",
+})
 
 # Notion integration (optional). Set EITHER:
 #   NOTION_DATABASE_ID    → reports become DB rows with structured properties
@@ -173,6 +188,113 @@ def _jwt_decode(token: str) -> dict[str, Any] | None:
         return None
 
 
+# ─────────── OAuth client registry + auth code store ───────────
+from urllib.parse import urlparse as _urlparse
+
+
+def _is_valid_redirect_uri(uri: str) -> bool:
+    """https 强制 + localhost/127.0.0.1/::1 例外 (本地调试 client 常用)。
+    禁止 http://(非 loopback)、file://、自定义 scheme(MCP 移动 connector
+    会用自定义 scheme,但目前我们的部署只接 web client,真有自定义 scheme
+    需求再放开)。"""
+    if not uri or not isinstance(uri, str):
+        return False
+    try:
+        u = _urlparse(uri)
+    except Exception:
+        return False
+    if u.scheme == "https":
+        return bool(u.netloc)
+    if u.scheme == "http":
+        host = (u.hostname or "").lower()
+        return host in ("localhost", "127.0.0.1", "::1")
+    return False
+
+
+def _load_oauth_clients():
+    """启动时从 /tmp 恢复已注册 client。文件丢了也无所谓 — 客户端走一次
+    DCR 就重新注册。"""
+    if not os.path.exists(_OAUTH_CLIENTS_PATH):
+        return
+    try:
+        with open(_OAUTH_CLIENTS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            with _oauth_clients_lock:
+                _oauth_clients.update(data)
+            print(f"[oauth] restored {len(data)} clients from disk", flush=True)
+    except Exception as e:
+        print(f"[oauth] restore clients err: {e}", flush=True)
+
+
+def _save_oauth_clients():
+    try:
+        with _oauth_clients_lock:
+            snapshot = dict(_oauth_clients)
+        with open(_OAUTH_CLIENTS_PATH, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[oauth] save clients err: {e}", flush=True)
+
+
+_load_oauth_clients()
+
+
+def _register_oauth_client(redirect_uris: list[str]) -> str:
+    """生成 client_id,把它和 redirect_uris allowlist 写入 registry。"""
+    cid = "mcp-" + secrets.token_urlsafe(12)
+    with _oauth_clients_lock:
+        _oauth_clients[cid] = {
+            "redirect_uris": list(redirect_uris),
+            "issued_at": int(time.time()),
+        }
+    _save_oauth_clients()
+    return cid
+
+
+def _lookup_client(client_id: str) -> dict | None:
+    with _oauth_clients_lock:
+        return _oauth_clients.get(client_id)
+
+
+def _client_allows_redirect(client_id: str, redirect_uri: str) -> bool:
+    """精确匹配,不做 prefix / 模式匹配,杜绝 open redirect。"""
+    c = _lookup_client(client_id)
+    if not c:
+        return False
+    return redirect_uri in (c.get("redirect_uris") or [])
+
+
+def _save_oauth_code(client_id: str, redirect_uri: str, code_challenge: str,
+                    scope: str) -> str:
+    """生成不可猜测的 opaque code,服务端存映射。token 兑换时 pop & delete。"""
+    code = secrets.token_urlsafe(32)
+    with _oauth_codes_lock:
+        _oauth_codes[code] = {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "code_challenge": code_challenge,
+            "scope": scope,
+            "expires_at": int(time.time()) + AUTH_CODE_TTL,
+        }
+        # 顺便扫一遍删除过期 code 防止内存累积
+        now = int(time.time())
+        for k in [k for k, v in _oauth_codes.items() if v["expires_at"] < now]:
+            del _oauth_codes[k]
+    return code
+
+
+def _pop_oauth_code(code: str) -> dict | None:
+    """pop & delete — 一次性使用。"""
+    with _oauth_codes_lock:
+        entry = _oauth_codes.pop(code, None)
+    if not entry:
+        return None
+    if entry["expires_at"] < int(time.time()):
+        return None
+    return entry
+
+
 # ─────────── base URL helpers ───────────
 def _base_from_request(request: Request) -> str:
     if PUBLIC_BASE_URL:
@@ -197,8 +319,11 @@ PUBLIC_PATHS = frozenset({
     "/register",
     "/authorize",
     "/token",
-    "/feishu/events",  # Feishu signs the request itself; no Bearer needed
 })
+# Feishu webhook 路径只有 FEISHU_ENABLED 时才公开(同时启动校验了 token),
+# 否则不放进 PUBLIC_PATHS — 这样即便误注册了路由也会走 Bearer 检查。
+if FEISHU_ENABLED:
+    PUBLIC_PATHS = PUBLIC_PATHS | {"/feishu/events"}
 
 
 # ─────────── auth middleware (Bearer static OR JWT) ───────────
@@ -222,6 +347,19 @@ class AuthMiddleware:
             return
 
         token = auth[7:].decode("ascii", errors="ignore").strip()
+        path = scope.get("path", "")
+        # /_debug/* 路径要求 ADMIN_AUTH_TOKEN(独立于 MCP_AUTH_TOKEN)。
+        # 这样泄露 MCP 用户 token 不会顺带打开运维通道。
+        if path.startswith("/_debug/"):
+            if not ADMIN_AUTH_TOKEN:
+                await self._reject(scope, receive, send, "debug_disabled")
+                return
+            if secrets.compare_digest(token, ADMIN_AUTH_TOKEN):
+                await self.app(scope, receive, send)
+                return
+            await self._reject(scope, receive, send, "admin_token_required")
+            return
+
         if secrets.compare_digest(token, EXPECTED_TOKEN):
             await self.app(scope, receive, send)
             return
@@ -285,16 +423,35 @@ async def oauth_protected_resource(request):
 
 # ─────────── Dynamic Client Registration ───────────
 async def register(request):
+    """RFC 7591 DCR. 之前实现只是回显 redirect_uris,**没有服务端保存** —
+    导致 /authorize 阶段 client_id 可被伪造、redirect_uri 可被任意改成
+    钓鱼地址。修复:把 client_id 和 redirect_uris allowlist 真正存到 registry,
+    /authorize + /token 严格 lookup 校验。"""
     try:
-        body = await request.json() if (await request.body()) else {}
+        raw = await request.body()
+        body = json.loads(raw) if raw else {}
     except Exception:
         body = {}
     if not isinstance(body, dict):
         body = {}
+    uris = body.get("redirect_uris") or []
+    if not isinstance(uris, list) or not uris:
+        return JSONResponse(
+            {"error": "invalid_redirect_uri",
+             "error_description": "redirect_uris must be a non-empty list"},
+            status_code=400)
+    invalid = [u for u in uris if not _is_valid_redirect_uri(u)]
+    if invalid:
+        return JSONResponse(
+            {"error": "invalid_redirect_uri",
+             "error_description": (
+                 f"only https or http://localhost(:port) allowed; got: {invalid}")},
+            status_code=400)
+    cid = _register_oauth_client(uris)
     return JSONResponse({
-        "client_id": "mcp-" + secrets.token_urlsafe(12),
+        "client_id": cid,
         "client_id_issued_at": int(time.time()),
-        "redirect_uris": body.get("redirect_uris", []),
+        "redirect_uris": uris,
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
@@ -346,17 +503,29 @@ def _render_login(params, error=""):
             .replace("__CLIENT_ID__", html.escape(params.get("client_id", "(unknown)"))))
 
 
+def _check_authorize_params(params: dict) -> tuple[bool, str]:
+    """共享校验:必填字段 + response_type + code_challenge_method + client_id
+    已注册 + redirect_uri 在 client 的 allowlist 里。"""
+    for k in ("response_type", "client_id", "redirect_uri",
+              "code_challenge", "code_challenge_method"):
+        if not params.get(k):
+            return False, f"missing: {k}"
+    if params["response_type"] != "code":
+        return False, "unsupported_response_type"
+    if params["code_challenge_method"] != "S256":
+        return False, "need S256"
+    if not _lookup_client(params["client_id"]):
+        return False, "unknown client_id"
+    if not _client_allows_redirect(params["client_id"], params["redirect_uri"]):
+        return False, "redirect_uri not in client allowlist"
+    return True, ""
+
+
 async def authorize_get(request):
     params = dict(request.query_params)
-    required = ["response_type", "client_id", "redirect_uri",
-                "code_challenge", "code_challenge_method"]
-    missing = [k for k in required if not params.get(k)]
-    if missing:
-        return HTMLResponse(f"missing: {', '.join(missing)}", status_code=400)
-    if params["response_type"] != "code":
-        return HTMLResponse("unsupported_response_type", status_code=400)
-    if params["code_challenge_method"] != "S256":
-        return HTMLResponse("need S256", status_code=400)
+    ok, err = _check_authorize_params(params)
+    if not ok:
+        return HTMLResponse(err, status_code=400)
     return HTMLResponse(_render_login(params))
 
 
@@ -364,21 +533,18 @@ async def authorize_post(request):
     form = await request.form()
     secret = str(form.get("secret", ""))
     params = {k: str(v) for k, v in form.items() if k != "secret"}
-    for k in ("response_type", "client_id", "redirect_uri",
-              "code_challenge", "code_challenge_method"):
-        if not params.get(k):
-            return HTMLResponse(f"missing: {k}", status_code=400)
+    ok, err = _check_authorize_params(params)
+    if not ok:
+        return HTMLResponse(err, status_code=400)
     if not secrets.compare_digest(secret, EXPECTED_TOKEN):
         return HTMLResponse(_render_login(params, "Invalid token."), status_code=401)
-    now = int(time.time())
-    code = _jwt_encode({
-        "typ": "code", "client_id": params["client_id"],
-        "redirect_uri": params["redirect_uri"],
-        "code_challenge": params["code_challenge"],
-        "code_challenge_method": params["code_challenge_method"],
-        "scope": params.get("scope", "mcp"),
-        "iat": now, "exp": now + AUTH_CODE_TTL,
-    })
+    # 服务端存一次性 opaque code(替代之前的自签 JWT — JWT 可被重放且无服务端 revoke)
+    code = _save_oauth_code(
+        client_id=params["client_id"],
+        redirect_uri=params["redirect_uri"],
+        code_challenge=params["code_challenge"],
+        scope=params.get("scope", "mcp"),
+    )
     qs = {"code": code}
     if params.get("state"):
         qs["state"] = params["state"]
@@ -416,17 +582,18 @@ async def token_endpoint(request):
         redirect_uri = str(form.get("redirect_uri", ""))
         if not (code and verifier and client_id and redirect_uri):
             return _oauth_error("invalid_request", "missing params")
-        p = _jwt_decode(code)
-        if not p or p.get("typ") != "code":
+        # 服务端一次性 code:pop + delete,任何后续重放都失败。
+        entry = _pop_oauth_code(code)
+        if not entry:
             return _oauth_error("invalid_grant", "invalid or expired code")
-        if p.get("client_id") != client_id:
+        if entry["client_id"] != client_id:
             return _oauth_error("invalid_grant", "client_id mismatch")
-        if p.get("redirect_uri") != redirect_uri:
+        if entry["redirect_uri"] != redirect_uri:
             return _oauth_error("invalid_grant", "redirect_uri mismatch")
         expected = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
-        if not hmac.compare_digest(expected, str(p.get("code_challenge", ""))):
+        if not hmac.compare_digest(expected, entry["code_challenge"]):
             return _oauth_error("invalid_grant", "PKCE verification failed")
-        return _issue_tokens(client_id=client_id, scope=str(p.get("scope", "mcp")))
+        return _issue_tokens(client_id=client_id, scope=entry["scope"])
     if grant == "refresh_token":
         rt = str(form.get("refresh_token", ""))
         if not rt:
@@ -434,8 +601,16 @@ async def token_endpoint(request):
         p = _jwt_decode(rt)
         if not p or p.get("typ") != "refresh":
             return _oauth_error("invalid_grant", "invalid or expired refresh token")
-        return _issue_tokens(client_id=str(p.get("client_id", "")),
-                             scope=str(p.get("scope", "mcp")))
+        rt_client_id = str(p.get("client_id", ""))
+        # client 仍然要在 registry 里(注册被吊销 / 服务端文件丢失场景拦截)
+        if not _lookup_client(rt_client_id):
+            return _oauth_error("invalid_grant", "client no longer registered")
+        # 如果请求带 client_id,必须和 refresh token 里的一致(防 token 串用)
+        req_client_id = str(form.get("client_id", "")).strip()
+        if req_client_id and req_client_id != rt_client_id:
+            return _oauth_error("invalid_grant", "client_id mismatch")
+        scope = str(p.get("scope", "mcp"))
+        return _issue_tokens(client_id=rt_client_id, scope=scope)
     return _oauth_error("unsupported_grant_type", grant)
 
 
@@ -552,14 +727,19 @@ async def debug_fix_historic_doc_share(request):
     """Bulk-set link-share=tenant_readable on every docx the bot owns,
     retroactively fixing docs created before FEISHU_DOC_SHARE_ENTITY was added.
 
-    Query params:
-      entity (default tenant_readable)
+    POST query params:
+      entity (default tenant_readable, MUST be in FEISHU_LINK_SHARE_ENTITIES)
       dry_run (default false): if 'true', only list counts, don't patch
-      page_cap (default 20): max pages of 50 files each (1000 docs)
+      page_cap (default 20, max 40): max pages of 50 files each
     """
     if not FEISHU_ENABLED:
         return JSONResponse({"error": "feishu disabled"}, status_code=400)
     entity = (request.query_params.get("entity") or "tenant_readable").strip()
+    if entity not in FEISHU_LINK_SHARE_ENTITIES:
+        return JSONResponse(
+            {"error": "invalid entity",
+             "valid": sorted(FEISHU_LINK_SHARE_ENTITIES)},
+            status_code=400)
     dry_run = (request.query_params.get("dry_run") or "").lower() in ("1", "true", "yes")
     page_cap = max(1, min(40, int(request.query_params.get("page_cap") or "20")))
 
@@ -1920,6 +2100,22 @@ def _build_feishu_card(summary: dict, run_id: str,
                 "tag": "div",
                 "text": {"tag": "lark_md", "content": "\n".join(lines)},
             })
+    else:
+        # 用户明确指定了游资但 voice 自判不适用 — 显式告知,别让用户以为系统挂了。
+        skipped = summary.get("youzi_skipped_override") or []
+        if skipped:
+            elements.append({"tag": "hr"})
+            names = " / ".join(
+                f"{s.get('display_name', '')}({s.get('school', '')})"
+                for s in skipped if isinstance(s, dict))
+            elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md",
+                         "content": (f"**🐊 你指定的游资:{names}**\n"
+                                     "判断本标的不在他/她的能力圈/方法论适用范围,"
+                                     "本次无观点。换个游资再试(例:『用 92 科比看 ...』)"
+                                     "或不指定游资让系统自动选最相关的。")},
+            })
 
     # Footer: full-report links (Feishu doc + Notion) + run id
     actions = []
@@ -2405,6 +2601,18 @@ def _feishu_create_doc_from_report(summary: dict, full_report: str,
             for line in v["text"].split("\n"):
                 if line.strip():
                     blocks.append(_feishu_text_block(line.strip(), "text"))
+    else:
+        skipped = summary.get("youzi_skipped_override") or []
+        if skipped:
+            names = " / ".join(
+                f"{s.get('display_name', '')}({s.get('school', '')})"
+                for s in skipped if isinstance(s, dict))
+            blocks.append({"block_type": 22, "divider": {}})
+            blocks.append(_feishu_text_block(
+                f"🐊 你指定的游资:{names}", "heading2"))
+            blocks.append(_feishu_text_block(
+                "判断本标的不在他/她的能力圈/方法论适用范围,本次无观点。"
+                "换个游资再试,或不指定让系统自动选最相关的。", "text"))
 
     blocks.append({"block_type": 22, "divider": {}})
     blocks.append(_feishu_text_block("完整原始报告", "heading2"))
@@ -2631,6 +2839,23 @@ async def _notion_create_page(summary: dict, full_report: str, run_id: str,
                     "paragraph": {"rich_text": [{"type": "text",
                                                   "text": {"content": line[:1900]}}]},
                 })
+    else:
+        skipped = summary.get("youzi_skipped_override") or []
+        if skipped:
+            names = " / ".join(
+                f"{s.get('display_name', '')}({s.get('school', '')})"
+                for s in skipped if isinstance(s, dict))
+            body_blocks.append({"object": "block", "type": "divider", "divider": {}})
+            body_blocks.append({
+                "object": "block", "type": "heading_2",
+                "heading_2": {"rich_text": [{"type": "text",
+                                              "text": {"content": f"🐊 你指定的游资:{names}"}}]},
+            })
+            body_blocks.append({
+                "object": "block", "type": "paragraph",
+                "paragraph": {"rich_text": [{"type": "text",
+                                              "text": {"content": "判断本标的不在他/她的能力圈/方法论适用范围,本次无观点。换个游资再试,或不指定让系统自动选最相关的。"}}]},
+            })
 
     body_blocks.append({"object": "block", "type": "divider", "divider": {}})
     body_blocks.append({
@@ -2763,6 +2988,16 @@ async def _publish_terminal_run(run, info: dict) -> None:
             print(f"[publish] guru views EMPTY {run_id} "
                   f"(preset={preset}, override={bool(gurus_override)}) — "
                   f"卡片将不带 游资速看 段", flush=True)
+            # 如果用户明确指定了游资但 voice LLM 判定不适用,在卡片/docx/Notion
+            # 显式告知 — 不让用户以为系统挂了。
+            if gurus_override:
+                safe = [g for g in gurus_override if g in _GURU_SKILLS][:GURU_VIEW_MAX]
+                summary["youzi_skipped_override"] = [
+                    {"guru": g,
+                     "display_name": GURU_META.get(g, (g, ""))[0],
+                     "school": GURU_META.get(g, ("", ""))[1]}
+                    for g in safe
+                ]
     except Exception as e:
         print(f"[publish] guru exception {run_id}: {e}", flush=True)
 
@@ -2858,34 +3093,81 @@ def _feishu_poll_loop():
         loop.close()
 
 
+# 简单的 per-IP token bucket 防止 webhook 被刷。Feishu 自己 ~3 个 retry,
+# 正常单 IP 每秒不该超过个位数请求。
+_feishu_webhook_rate: dict[str, list[float]] = {}
+_feishu_webhook_rate_lock = threading.Lock()
+
+
+def _feishu_rate_limit_ok(ip: str) -> bool:
+    if FEISHU_WEBHOOK_RATE_LIMIT <= 0:
+        return True
+    now = time.time()
+    window = 60.0
+    cutoff = now - window
+    with _feishu_webhook_rate_lock:
+        bucket = [t for t in _feishu_webhook_rate.get(ip, []) if t > cutoff]
+        if len(bucket) >= FEISHU_WEBHOOK_RATE_LIMIT:
+            _feishu_webhook_rate[ip] = bucket
+            return False
+        bucket.append(now)
+        _feishu_webhook_rate[ip] = bucket
+    return True
+
+
+def _check_feishu_secret(body: dict, header: dict) -> bool:
+    """v1 schema body.token / v2 schema header.token 任一匹配即可。
+    必须有 FEISHU_VERIFICATION_TOKEN — 启动时强制要求,这里二次校验。"""
+    if not FEISHU_VERIFICATION_TOKEN:
+        return False
+    incoming = (body.get("token") if body.get("type") == "url_verification"
+                else header.get("token")) or ""
+    return hmac.compare_digest(str(incoming), FEISHU_VERIFICATION_TOKEN)
+
+
 # Webhook
 async def feishu_events(request: Request):
-    """Feishu event webhook. Handles:
-       - URL verification (type=url_verification, returns the challenge)
-       - im.message.receive_v1 (schema 2.0)
+    """Feishu event webhook.
+
+    安全前置:
+    1. FEISHU_ENABLED 隐含「verification token 或 encrypt key 已设」(启动时校验)
+    2. 每个 POST 都必须带正确 token,不接受裸调用
+    3. body size 上限防 OOM,rate limit 防刷
     """
     if not FEISHU_ENABLED:
-        return JSONResponse({"error": "feishu integration not configured (set LARK_APP_ID/SECRET)"}, status_code=503)
+        return JSONResponse({"error": "feishu integration not configured"},
+                            status_code=503)
+
+    # body size 上限 — 提前从 Content-Length 拦截,防止恶意大包占内存。
+    cl = request.headers.get("content-length")
+    if cl and cl.isdigit() and int(cl) > FEISHU_WEBHOOK_MAX_BYTES:
+        return JSONResponse({"error": "payload too large"}, status_code=413)
+
+    client_ip = request.client.host if request.client else "unknown"
+    if not _feishu_rate_limit_ok(client_ip):
+        print(f"[feishu] rate-limited {client_ip}", flush=True)
+        return JSONResponse({"error": "rate limited"}, status_code=429)
 
     body_bytes = await request.body()
+    if len(body_bytes) > FEISHU_WEBHOOK_MAX_BYTES:
+        return JSONResponse({"error": "payload too large"}, status_code=413)
     try:
         body = json.loads(body_bytes)
     except json.JSONDecodeError:
         return JSONResponse({"error": "invalid json"}, status_code=400)
 
-    # Legacy URL verification (schema v1): {"type": "url_verification", "token": "...", "challenge": "..."}
+    header = body.get("header") or {}
+    if not _check_feishu_secret(body, header):
+        # 不告诉攻击者具体哪个字段错了
+        print(f"[feishu] reject bad token from {client_ip}", flush=True)
+        return JSONResponse({"error": "unauthorized"}, status_code=403)
+
+    # Legacy URL verification (schema v1)
     if body.get("type") == "url_verification":
-        if FEISHU_VERIFICATION_TOKEN and body.get("token") != FEISHU_VERIFICATION_TOKEN:
-            return JSONResponse({"error": "bad token"}, status_code=403)
         return JSONResponse({"challenge": body.get("challenge")})
 
-    # Schema v2: {"schema":"2.0","header":{...,"event_type":"..."}, "event":{...}}
+    # Schema v2
     if body.get("schema") == "2.0":
-        header = body.get("header") or {}
-        if FEISHU_VERIFICATION_TOKEN and header.get("token") != FEISHU_VERIFICATION_TOKEN:
-            return JSONResponse({"error": "bad token"}, status_code=403)
-        # Dedup by event_id — Feishu retries deliver the same event_id, so a
-        # second call here is a duplicate we must drop before firing the handler.
         event_id = header.get("event_id", "")
         if _is_duplicate_feishu_event(event_id):
             print(f"[feishu] dedup: dropping duplicate event_id={event_id}", flush=True)
@@ -2893,7 +3175,6 @@ async def feishu_events(request: Request):
         event_type = header.get("event_type", "")
         if event_type == "im.message.receive_v1":
             asyncio.create_task(_feishu_handle_message(body))
-        # Always 200 quickly so Feishu doesn't retry. Real work happens async.
         return JSONResponse({"code": 0})
 
     return JSONResponse({"code": 0})
@@ -2928,8 +3209,43 @@ HELP_TEXT = (
 )
 
 
-def _resolve_latest_run_id(filter_status: str | None = "completed") -> str | None:
-    """Return the most recent run_id matching filter_status. None if no match."""
+def _run_owner(run_id: str) -> tuple[str, str]:
+    """Read (chat_id, sender_open_id) ownership for a run from feishu_meta.json.
+    Empty strings if meta missing (run wasn't initiated via Feishu — only
+    visible to admin)."""
+    # 先看 in-memory pending(in-flight)
+    with _feishu_pending_lock:
+        meta = _feishu_pending.get(run_id)
+    if not meta:
+        meta = _load_feishu_meta(run_id) or {}
+    return (meta.get("receive_id") or ""), (meta.get("sender_open_id") or "")
+
+
+def _authz_run_for(run_id: str, chat_id: str, sender_open_id: str) -> bool:
+    """True if the requester (chat + sender) can access this run.
+
+    Rule: requester sees a run iff the run was triggered from THIS chat
+    OR by THIS sender personally. 这样:
+      - 群 A 的用户不能查 / 取消 / 重发 群 B 的 run
+      - 私聊也不能查别人的 run
+    No-meta runs (e.g. MCP-direct fires by admin) are NOT visible to any
+    Feishu chat — those must go through /_debug/republish with admin token.
+    """
+    owner_chat, owner_sender = _run_owner(run_id)
+    if not owner_chat and not owner_sender:
+        return False
+    if chat_id and owner_chat == chat_id:
+        return True
+    if sender_open_id and owner_sender == sender_open_id:
+        return True
+    return False
+
+
+def _resolve_latest_run_id(filter_status: str | None = "completed",
+                            chat_id: str = "", sender_open_id: str = "") -> str | None:
+    """Return the most recent run_id this chat/sender owns. None if no match.
+
+    Authz: only sees runs originating from THIS chat or THIS sender's open_id."""
     from src.swarm.store import SwarmStore
     import pathlib
     swarm_dir = pathlib.Path(mcp_server.__file__).resolve().parent / ".swarm" / "runs"
@@ -2940,10 +3256,11 @@ def _resolve_latest_run_id(filter_status: str | None = "completed") -> str | Non
         return None
     if filter_status:
         runs = [r for r in runs if r.status.value == filter_status]
-    if not runs:
-        return None
     runs.sort(key=lambda r: r.created_at, reverse=True)
-    return runs[0].id
+    for r in runs:
+        if _authz_run_for(r.id, chat_id, sender_open_id):
+            return r.id
+    return None
 
 
 def _build_preset_vars(preset: str, target: str | None, market: str | None,
@@ -3035,24 +3352,36 @@ async def _feishu_handle_message(body: dict):
                     chat_id,
                     status_filter=llm_result.get("status_filter"),
                     limit=int(llm_result.get("limit") or 10),
+                    sender_open_id=sender_open_id,
                 )
             elif action == "status":
                 run_id = llm_result.get("run_id") or "latest"
                 if run_id == "latest":
-                    resolved = _resolve_latest_run_id("completed") or _resolve_latest_run_id(None)
+                    resolved = (_resolve_latest_run_id("completed", chat_id, sender_open_id)
+                                or _resolve_latest_run_id(None, chat_id, sender_open_id))
                     if not resolved:
-                        _feishu_send_text(chat_id, "chat_id", "没有 run 记录。")
+                        _feishu_send_text(chat_id, "chat_id", "没有你的 run 记录。")
                         return
                     run_id = resolved
+                # authz:run 必须属于这个 chat 或这个 sender
+                if not _authz_run_for(run_id, chat_id, sender_open_id):
+                    _feishu_send_text(chat_id, "chat_id",
+                                      f"⛔ 这个 run 不属于本聊天,无权查看")
+                    return
                 await _feishu_handle_status(chat_id, run_id)
             elif action == "cancel_run":
                 run_id = llm_result.get("run_id") or "latest"
                 if run_id == "latest":
-                    resolved = _resolve_latest_run_id("running") or _resolve_latest_run_id(None)
+                    resolved = (_resolve_latest_run_id("running", chat_id, sender_open_id)
+                                or _resolve_latest_run_id(None, chat_id, sender_open_id))
                     if not resolved:
-                        _feishu_send_text(chat_id, "chat_id", "没有 run 可以 cancel。")
+                        _feishu_send_text(chat_id, "chat_id", "没有你的 run 可以 cancel。")
                         return
                     run_id = resolved
+                if not _authz_run_for(run_id, chat_id, sender_open_id):
+                    _feishu_send_text(chat_id, "chat_id",
+                                      f"⛔ 这个 run 不属于本聊天,无权 cancel")
+                    return
                 await _feishu_handle_cancel_run(chat_id, run_id)
             elif action == "help":
                 _feishu_send_text(chat_id, "chat_id", HELP_TEXT)
@@ -3311,7 +3640,10 @@ _VALID_RUN_STATUS_FILTERS = frozenset({"completed", "failed", "running", "cancel
 
 
 async def _feishu_handle_list_runs(chat_id: str, status_filter: str | None = None,
-                                    limit: int = 10) -> None:
+                                    limit: int = 10,
+                                    sender_open_id: str = "") -> None:
+    """List runs **owned by this chat or this sender** only.
+    群 A 看不到群 B 的 run,私聊看不到他人的 run。"""
     from src.swarm.store import SwarmStore
     import pathlib
     swarm_dir = pathlib.Path(mcp_server.__file__).resolve().parent / ".swarm" / "runs"
@@ -3331,19 +3663,21 @@ async def _feishu_handle_list_runs(chat_id: str, status_filter: str | None = Non
             return
         runs = [r for r in runs if r.status.value == sf]
 
+    # 权限过滤:只保留 chat_id 或 sender_open_id 拥有的 run。
+    runs = [r for r in runs if _authz_run_for(r.id, chat_id, sender_open_id)]
+
     if limit < 1:
         limit = 10
     runs = runs[:limit]
 
     if not runs:
         scope = f" (status={status_filter})" if status_filter else ""
-        _feishu_send_text(chat_id, "chat_id", f"暂无 run 记录{scope}。")
+        _feishu_send_text(chat_id, "chat_id", f"暂无你的 run 记录{scope}。")
         return
 
-    header = f"最近 {len(runs)} 个 run" + (f" (status={status_filter})" if status_filter else "") + ":"
+    header = f"你的最近 {len(runs)} 个 run" + (f" (status={status_filter})" if status_filter else "") + ":"
     lines = [header]
     for r in runs:
-        # tokens may be 0/0 while running — present cleanly
         tok = f"{r.total_input_tokens}/{r.total_output_tokens}"
         lines.append(f"  {r.id}  {r.preset_name}  {r.status.value}  tok={tok}")
     lines.append("\n💡 查具体报告: 查一下 <run_id>  或  status latest")
@@ -3401,7 +3735,27 @@ def _notify_interrupted_runs() -> int:
 
 
 @asynccontextmanager
+def _assert_httpx_timeout_not_capped() -> None:
+    """启动时自检:_deepseek_json_call 想要的 read=90 没被任何 import 副作用悄悄
+    改成更小的值。之前 monkey patch 全局 cap 60s,这里固化为运行时断言。"""
+    tc = httpx.Timeout(connect=10, read=90, write=15, pool=5)
+    c = httpx.AsyncClient(timeout=tc)
+    try:
+        rd = c.timeout.read
+        if abs(float(rd) - 90.0) > 0.01:
+            raise RuntimeError(
+                f"FATAL: httpx AsyncClient read timeout is {rd}, expected 90. "
+                f"Something is monkey-patching httpx clients.")
+    finally:
+        # 不真发请求,纯结构 assert,关掉同步释放。
+        # AsyncClient.aclose 是协程,这里 best-effort 不 await。
+        pass
+    print(f"[boot] httpx timeout self-test ok: read={rd}s", flush=True)
+
+
 async def _lifespan(app):
+    # 启动断言
+    _assert_httpx_timeout_not_capped()
     # Defer to FastMCP's own lifespan first
     async with mcp_app.lifespan(app):
         if FEISHU_ENABLED:
@@ -3441,26 +3795,47 @@ async def _lifespan(app):
 
 
 # ─────────── app assembly ───────────
-app = Starlette(
-    routes=[
-        Route("/", root),
-        Route("/healthz", healthz),
-        Route("/.well-known/oauth-authorization-server", oauth_authorization_server),
-        Route("/.well-known/oauth-protected-resource", oauth_protected_resource),
-        Route("/register", register, methods=["POST"]),
-        Route("/authorize", authorize_get, methods=["GET"]),
-        Route("/authorize", authorize_post, methods=["POST"]),
-        Route("/token", token_endpoint, methods=["POST"]),
-        Route("/feishu/events", feishu_events, methods=["POST"]),
-        Route("/_debug/threads", debug_threads),
-        Route("/_debug/swarm-state", debug_swarm_state),
-        Route("/_debug/purge-run", debug_purge_run),
-        Route("/_debug/env", debug_env),
-        Route("/_debug/list-feishu-chats", debug_list_feishu_chats),
+# 基础路由 — 始终注册。
+_base_routes = [
+    Route("/", root),
+    Route("/healthz", healthz),
+    Route("/.well-known/oauth-authorization-server", oauth_authorization_server),
+    Route("/.well-known/oauth-protected-resource", oauth_protected_resource),
+    Route("/register", register, methods=["POST"]),
+    Route("/authorize", authorize_get, methods=["GET"]),
+    Route("/authorize", authorize_post, methods=["POST"]),
+    Route("/token", token_endpoint, methods=["POST"]),
+]
+
+# /feishu/events 仅在配置了 token/encrypt key 时注册(防裸跑)。
+if FEISHU_ENABLED:
+    _base_routes.append(
+        Route("/feishu/events", feishu_events, methods=["POST"]))
+
+# /_debug/* 仅在 ENABLE_DEBUG_ENDPOINTS=true 且 ADMIN_AUTH_TOKEN 设了时注册。
+# Read-only: GET; mutating: POST (purge-run / republish / fix-historic-doc-share)
+if DEBUG_ENDPOINTS_ACTIVE:
+    _base_routes.extend([
+        Route("/_debug/threads", debug_threads, methods=["GET"]),
+        Route("/_debug/swarm-state", debug_swarm_state, methods=["GET"]),
+        Route("/_debug/env", debug_env, methods=["GET"]),
+        Route("/_debug/list-feishu-chats", debug_list_feishu_chats, methods=["GET"]),
+        Route("/_debug/purge-run", debug_purge_run, methods=["POST"]),
         Route("/_debug/republish", debug_republish, methods=["POST"]),
-        Route("/_debug/fix-historic-doc-share", debug_fix_historic_doc_share),
-        Mount("/", app=mcp_app),
-    ],
+        Route("/_debug/fix-historic-doc-share", debug_fix_historic_doc_share,
+              methods=["POST"]),
+    ])
+    print(f"[boot] debug endpoints active: /_debug/* (admin token required)",
+          flush=True)
+else:
+    print(f"[boot] debug endpoints DISABLED "
+          f"(ENABLE_DEBUG_ENDPOINTS={ENABLE_DEBUG_ENDPOINTS}, "
+          f"ADMIN_AUTH_TOKEN set={bool(ADMIN_AUTH_TOKEN)})", flush=True)
+
+_base_routes.append(Mount("/", app=mcp_app))
+
+app = Starlette(
+    routes=_base_routes,
     middleware=[Middleware(AuthMiddleware)],
     lifespan=_lifespan,
 )

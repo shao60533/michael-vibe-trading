@@ -19,6 +19,35 @@ cut 版本时把 `[Unreleased]` 整体移到一个带日期的版本号下，再
 
 ## [Unreleased]
 
+### Security (重要 — 行为有 breaking 变化)
+
+- **OAuth 加固**:
+  - `/register` 之前只回显 `redirect_uris` 不做服务端保存,任何人都能构造任意 client_id + 任意 redirect_uri 走授权流。现在 client_id 由服务端发号 + `redirect_uris` 写入 `/tmp/oauth_clients.json` allowlist。
+  - `/authorize`(GET+POST)校验 `client_id` 已注册,`redirect_uri` 在该 client 的 allowlist 中(精确匹配,无 prefix / 模式)。
+  - `redirect_uri` 只允许 `https://` 或 `http://localhost`/`127.0.0.1`(本地 client)。其他 scheme 全部拒绝。
+  - 授权码从「自签 JWT(可重放)」改为「服务端一次性 opaque code」,`/token` 兑换时 pop+delete,内存里同时清扫过期 code。
+  - Refresh token 仍是 JWT,但兑换时:校验 `typ==refresh`、client_id 仍在 registry、若请求带 client_id 必须与 token 内的一致。
+
+- **飞书 webhook 强制鉴权**:
+  - 启用了 `LARK_APP_ID`/`LARK_APP_SECRET` 但**没有**配 `FEISHU_VERIFICATION_TOKEN` 或 `FEISHU_ENCRYPT_KEY` 时,`/feishu/events` 路由不注册 + 启动 stderr 警告(防裸跑)。
+  - `/feishu/events` 每个 POST 都强制校验 token(`hmac.compare_digest`),没匹配返 403。
+  - 新增 `FEISHU_WEBHOOK_MAX_BYTES`(默认 64KB)body 上限,`FEISHU_WEBHOOK_RATE_LIMIT`(默认 30 req/IP/60s)防刷。
+
+- **飞书 run 权限隔离**:
+  - `list_runs` / `status` / `cancel_run` / `查一下 latest` 都按 `feishu_meta.json` 的 `receive_id`(chat_id)+ `sender_open_id` 做 authz。
+  - 群 A 不能查 / 取消 / 看群 B 的 run;私聊看不到他人 run。
+  - 通过 MCP 工具直接发起(无 feishu_meta)的 run 对所有 Feishu chat 不可见,只能从 `/_debug/republish` 走管理员通道补发。
+
+- **`/_debug/*` 收紧**:
+  - 新增 `ENABLE_DEBUG_ENDPOINTS`(默认 `false`)总开关 + `ADMIN_AUTH_TOKEN`(独立于 `MCP_AUTH_TOKEN`)凭据。两者都设才注册路由,生产默认安全。
+  - `AuthMiddleware` 拿到 `/_debug/*` 路径时强制要求 `ADMIN_AUTH_TOKEN`,不接受 `MCP_AUTH_TOKEN` 或 OAuth access token(防 MCP token 泄露顺带打开运维通道)。
+  - 副作用端点 (`purge-run` / `republish` / `fix-historic-doc-share`) 强制 `methods=["POST"]`。
+  - `fix-historic-doc-share` 的 `entity` 参数白名单校验(`tenant_readable` / `tenant_editable` / `anyone_readable` / `anyone_editable` / `closed`),拒绝任意值。
+
+### Fixed
+
+- **httpx timeout monkey patch 彻底移除**:之前全局 cap `httpx.Client.read=60`,但 `_deepseek_json_call` 需要 90s 给 DeepSeek-v4-pro reasoning model 长输出留时间,被悄悄改成 60s 偶发 ReadTimeout。移除全局 patch + 每个 `httpx.Client(...)` 调用点显式声明 timeout(已审计 7 处全合规)+ `_lifespan` 启动断言一个 `read=90` AsyncClient 实际拿到的就是 90.0(非任何 import 副作用改的)。
+
 ### Fixed
 
 - **LLM JSON 调用全面健壮化**:抽出共享 helper `_deepseek_json_call`,把 summarizer / guru route / guru voice 三个 site 统一收口。修复:

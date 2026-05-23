@@ -63,13 +63,23 @@ railway logs --service vibe-trading-mcp --build   # build 日志
 
 | 必填 | 变量 | 用途 |
 |------|------|------|
-| ✅ | `MCP_AUTH_TOKEN` | MCP Bearer 共享密钥 + OAuth 登录口令 |
+| ✅ | `MCP_AUTH_TOKEN` | MCP Bearer 共享密钥 + OAuth /authorize 口令(**勿与 ADMIN 共用**) |
 | ✅ | `DEEPSEEK_API_KEY` | swarm LLM 调用 + 摘要 + 游资视角 |
-| △ | `LARK_APP_ID` / `LARK_APP_SECRET` | 飞书 bot（不填则 webhook 不启用） |
+| △ | `LARK_APP_ID` / `LARK_APP_SECRET` | 飞书 bot 凭据 |
+| △ | `FEISHU_VERIFICATION_TOKEN` | **配了 LARK_APP_* 就必须配此项**(或 `FEISHU_ENCRYPT_KEY`),否则 `/feishu/events` 不注册 |
+| △ | `FEISHU_WEBHOOK_MAX_BYTES` / `FEISHU_WEBHOOK_RATE_LIMIT` | webhook body 上限 / per-IP 速率(默认 64KB / 30 req/60s) |
 | △ | `NOTION_API_KEY` + (`NOTION_DATABASE_ID` 或 `NOTION_PARENT_PAGE_ID`) | Notion 同步（不填则跳过） |
-| △ | `FEISHU_VERIFICATION_TOKEN` | 飞书事件校验 token（强烈建议） |
 | △ | `GURU_VIEW_MODE` | `auto`（默认，LLM 路由选游资）/ `fixed:n1,n2`（固定）/ `off`（关闭） |
 | △ | `GURU_VIEW_MAX` | 每次最多几位游资观点（1-3，默认 2） |
+| 🔒 | `ADMIN_AUTH_TOKEN` | `/_debug/*` 运维端点专用凭据,**与 MCP_AUTH_TOKEN 独立**;不设则所有 debug 路由不注册 |
+| 🔒 | `ENABLE_DEBUG_ENDPOINTS` | `true` 才注册 `/_debug/*`(默认 false,生产安全) |
+
+## 安全模型
+
+- **MCP / OAuth**:`/sse` 路径要求 Bearer = `MCP_AUTH_TOKEN`(静态)或经过 OAuth 流的 access token。DCR 动态注册客户端时,服务端保存 `client_id` 和 `redirect_uris` allowlist;`/authorize` 严格校验 `redirect_uri` 在客户端 allowlist 中,且 scheme 必须是 https(`localhost`/`127.0.0.1` 例外)。授权码是服务端一次性 opaque code(非 JWT),`/token` 兑换后立即失效。Refresh token 绑定 `client_id`,刷新时校验 client 仍在 registry。
+- **飞书 webhook**:`/feishu/events` 收到的每个 POST 必须带匹配的 `FEISHU_VERIFICATION_TOKEN`(或 encrypt key);否则 403。启用了 LARK_APP_* 但没设 token 时,路由根本不注册。body 有 size 上限 + per-IP 速率。
+- **飞书 run 权限隔离**:`list_runs` / `查一下 latest` / `取消 latest` / 显式 run_id 查询都按 `feishu_meta.json` 里的 `receive_id` + `sender_open_id` 做授权 — 群 A 看不到群 B 的 run,私聊看不到他人的 run,通过 MCP 直接发起(无 feishu_meta)的 run 对所有 Feishu chat 不可见(只能从 `/_debug/republish` 走管理员通道)。
+- **`/_debug/*`**:默认禁用。生效需要 `ENABLE_DEBUG_ENDPOINTS=true` + `ADMIN_AUTH_TOKEN` 都设。mutating 端点(`purge-run` / `republish` / `fix-historic-doc-share`)强制 POST。`fix-historic-doc-share` 的 `entity` 参数有白名单。
 
 ## 飞书使用指北
 
