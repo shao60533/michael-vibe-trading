@@ -21,6 +21,7 @@ cut 版本时把 `[Unreleased]` 整体移到一个带日期的版本号下，再
 
 ### Added
 
+- **F 方案:docx 写入用户云盘文件夹**:新增 `FEISHU_DRIVE_FOLDER_TOKEN` 环境变量。若设置,bot 创建 docx 时带 `folder_token` 参数,文档落到用户云盘指定文件夹下,自动继承文件夹的「分享/可见」权限。绕开 `drive:drive` 权限难题。前提:文件夹所有者要在飞书 UI 把该文件夹分享给 bot 并给「可编辑」权限。
 - **飞书 docx 自动开链接共享**：bot 新创建的每个 docx 默认设为「组织内可阅读」(`tenant_readable`),群成员可直接打开链接而无需申请权限。由 `FEISHU_DOC_SHARE_ENTITY` 环境变量控制(可改 `tenant_editable` / `anyone_readable` / `closed`)。需要 bot app 启用 `docs:doc` 或 `drive:drive` 权限并发新版本激活。
 - **`/_debug/list-feishu-chats`**：列出 bot 所在的所有群,返回 chat_id,用于运维操作
 - **`/_debug/republish`** (POST):用 final_report 文本 + chat_id 构造合成 Run 触发完整 publish,不依赖磁盘 Run 状态,用于补发被 deploy 擦盘丢失的报告

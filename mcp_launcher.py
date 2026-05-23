@@ -129,6 +129,11 @@ FEISHU_DEFAULT_PRESET = os.environ.get("FEISHU_DEFAULT_PRESET", "investment_comm
 # Valid: tenant_readable / tenant_editable / anyone_readable / anyone_editable / closed
 FEISHU_DOC_SHARE_ENTITY = os.environ.get("FEISHU_DOC_SHARE_ENTITY",
                                          "tenant_readable").strip().lower()
+# 用户云盘文件夹 token —— 若设置,bot 创建的每个 docx 都落在这个文件夹下,
+# 文档自动继承文件夹的「共享权限」(由文件夹所有者在飞书 UI 配)。
+# 这条路绕开「需要 drive:drive 才能改链接共享」的难题。
+# 前提:文件夹所有者必须在飞书把这个文件夹「分享」给 bot 并给「可编辑」权限。
+FEISHU_DRIVE_FOLDER_TOKEN = os.environ.get("FEISHU_DRIVE_FOLDER_TOKEN", "").strip()
 FEISHU_ENABLED = bool(LARK_APP_ID and LARK_APP_SECRET)
 
 # Notion integration (optional). Set EITHER:
@@ -2030,15 +2035,20 @@ def _feishu_send_card(receive_id: str, receive_id_type: str, card: dict) -> dict
 # ─────────── Feishu Docx (云文档) sync ───────────
 
 def _feishu_create_docx(title: str) -> tuple[str | None, str | None]:
-    """Create an empty docx in the bot's own drive. Returns (document_id, url)."""
+    """Create an empty docx. If FEISHU_DRIVE_FOLDER_TOKEN is set the docx
+    lands in that (user-owned) folder so it inherits the folder's share
+    settings — bypassing the need for drive:drive scope on the bot."""
     try:
         token = _feishu_get_tenant_token()
+        body: dict = {"title": title[:200]}
+        if FEISHU_DRIVE_FOLDER_TOKEN:
+            body["folder_token"] = FEISHU_DRIVE_FOLDER_TOKEN
         with httpx.Client(timeout=15) as c:
             r = c.post(
                 "https://open.feishu.cn/open-apis/docx/v1/documents",
                 headers={"Authorization": f"Bearer {token}",
                          "Content-Type": "application/json"},
-                json={"title": title[:200]},
+                json=body,
             )
             d = r.json()
         if d.get("code") != 0:
