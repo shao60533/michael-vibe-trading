@@ -3171,6 +3171,51 @@ from contextlib import asynccontextmanager
 mcp_app = mcp_server.mcp.http_app(transport="sse")
 
 
+def _notify_interrupted_runs() -> int:
+    """On graceful shutdown (Railway SIGTERM), tell each pending Feishu chat that
+    their in-flight run is dead so they don't wait forever. Container restart
+    will recover persisted runs that already finished but failed to publish — but
+    threads that were mid-LLM are gone and can't resume.
+
+    Returns the number of chats successfully notified.
+    """
+    notified = 0
+    try:
+        with _feishu_pending_lock:
+            pending = dict(_feishu_pending)
+    except Exception as e:
+        print(f"[shutdown] snapshot _feishu_pending err: {e}", flush=True)
+        return 0
+
+    if not pending:
+        print("[shutdown] no pending runs to notify", flush=True)
+        return 0
+
+    print(f"[shutdown] notifying {len(pending)} pending chats of interruption",
+          flush=True)
+    for run_id, meta in pending.items():
+        chat_id = meta.get("receive_id") or ""
+        chat_type = meta.get("receive_id_type") or "chat_id"
+        target = meta.get("target") or "(无标的)"
+        preset = meta.get("preset") or ""
+        if not chat_id:
+            continue
+        preset_zh = _PRESET_ZH.get(preset, preset) if preset else "?"
+        text = (
+            f"⚠️ 服务部署重启,本次分析被中断\n"
+            f"目标: {target} · preset: {preset_zh}\n"
+            f"run_id: {run_id}\n"
+            f"请重新发送原指令(已记录的进度无法恢复)"
+        )
+        try:
+            _feishu_send_text(chat_id, chat_type, text)
+            notified += 1
+        except Exception as e:
+            print(f"[shutdown] notify {run_id} err: {e}", flush=True)
+    print(f"[shutdown] notified {notified}/{len(pending)} chats", flush=True)
+    return notified
+
+
 @asynccontextmanager
 async def _lifespan(app):
     # Defer to FastMCP's own lifespan first
@@ -3194,7 +3239,21 @@ async def _lifespan(app):
                 print("[feishu] notion sync: disabled", flush=True)
         else:
             print("[feishu] disabled (LARK_APP_ID/SECRET not set)", flush=True)
-        yield
+        try:
+            yield
+        finally:
+            # Graceful shutdown — Railway SIGTERM lands here via uvicorn lifespan.
+            # We have ~30s before SIGKILL; send interruption notices then exit.
+            if FEISHU_ENABLED:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(_notify_interrupted_runs),
+                        timeout=20,
+                    )
+                except asyncio.TimeoutError:
+                    print("[shutdown] notify timed out at 20s", flush=True)
+                except Exception as e:
+                    print(f"[shutdown] notify err: {e}", flush=True)
 
 
 # ─────────── app assembly ───────────
