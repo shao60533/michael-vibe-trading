@@ -3932,10 +3932,6 @@ async def _feishu_handle_factor_research(chat_id: str,
             f"run_id: {run_id}")
 
 
-# Per-chat in-flight set — 同一聊天同时只允许一个 Sequoia-X 扫描在跑。
-# 防止用户连发 / 飞书 retry 导致 2 个并行扫描浪费配额 + 干扰
-_sequoia_in_flight: set[str] = set()
-_sequoia_in_flight_lock = threading.Lock()
 # 整体硬超时 (秒)。Sina/Eastmoney 接口偶发卡死会拖死 worker — 5 分钟兜底。
 SEQUOIA_HARD_TIMEOUT = int(os.environ.get("SEQUOIA_HARD_TIMEOUT", "300"))
 
@@ -3946,85 +3942,75 @@ async def _feishu_handle_sequoia_scan(chat_id: str,
     """Run the local Sequoia-X scanner, then push through the SAME publish
     pipeline as a swarm run (card + 飞书 docx + Notion).
 
-    Hardening:
-      - per-chat in-flight 去重 (同 chat 同时只允许一个 scan)
-      - asyncio.wait_for 300s 硬超时 (防 sina/eastmoney 卡死)
-      - SequoiaScanError / TimeoutError / ImportError / 通用 Exception 分别提示
+    并发模型:无 dedup,允许同聊天 / 不同 sender 并发触发。
+    - 飞书 retry 已在 webhook 层 event_id 维度去重
+    - 同一聊天 2+ 用户 / 2 个不同时间窗的需求都应该被允许
+    硬超时由 asyncio.wait_for 各自独立兜底。
     """
-    with _sequoia_in_flight_lock:
-        if chat_id in _sequoia_in_flight:
-            _feishu_send_text(chat_id, "chat_id",
-                "⏳ 本聊天已有 Sequoia-X 扫描在跑,等完成再发新指令。")
-            return
-        _sequoia_in_flight.add(chat_id)
+    _feishu_send_text(chat_id, "chat_id",
+        "🌲 开始跑 Sequoia-X A 股选股扫描\n"
+        "(6 策略 × 最近 5 个交易日 × 活跃 300 只,海龟突破 / RPS / 均线放量 / 涨停洗盘 等)\n"
+        f"约 1-3 分钟,硬超时 {SEQUOIA_HARD_TIMEOUT}s,完成后推回 卡片 + 飞书文档 + Notion。")
     try:
-        _feishu_send_text(chat_id, "chat_id",
-            "🌲 开始跑 Sequoia-X A 股选股扫描\n"
-            "(6 策略 × 最近 5 个交易日 × 活跃 300 只,海龟突破 / RPS / 均线放量 / 涨停洗盘 等)\n"
-            f"约 1-3 分钟,硬超时 {SEQUOIA_HARD_TIMEOUT}s,完成后推回 卡片 + 飞书文档 + Notion。")
-        try:
-            from sequoia_x import run_weekly_scan, SequoiaScanError
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    run_weekly_scan,
-                    days=5, max_symbols=300,
-                ),
-                timeout=SEQUOIA_HARD_TIMEOUT,
-            )
-        except SequoiaScanError as exc:
-            _feishu_send_text(chat_id, "chat_id",
-                f"❌ Sequoia-X 扫描中止:{exc}")
-            return
-        except asyncio.TimeoutError:
-            _feishu_send_text(chat_id, "chat_id",
-                f"❌ Sequoia-X 扫描超过 {SEQUOIA_HARD_TIMEOUT}s 硬超时 — "
-                "可能 sina/eastmoney 接口阻塞,稍后再试。")
-            return
-        except ImportError as exc:
-            _feishu_send_text(chat_id, "chat_id",
-                f"❌ sequoia_x 模块或依赖缺失:{exc}")
-            return
-        except Exception as exc:
-            print(f"[sequoia] unexpected err: {type(exc).__name__}: {exc}",
-                  flush=True)
-            _feishu_send_text(chat_id, "chat_id",
-                f"❌ Sequoia-X 扫描失败:{type(exc).__name__}: {exc}")
-            return
-
-        # publish 走标准管道
-        from types import SimpleNamespace
-        run_id = f"sequoia-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(4)}"
-        cov = result.get("coverage", {}) or {}
-        scope = (f"{cov.get('fetched_symbols', '?')}/"
-                 f"{cov.get('requested_symbols', '?')}只"
-                 f" × {len(result.get('dates', []))}天"
-                 f" ({cov.get('elapsed_seconds', '?')}s)")
-        fake_run = SimpleNamespace(
-            id=run_id,
-            status=SimpleNamespace(value="completed"),
-            final_report=result.get("report_markdown") or "(empty report)",
-            preset_name="sector_rotation_team",
-            user_vars={"target": "A股 Sequoia-X 选股", "market": "CN",
-                       "scope": scope,
-                       "error_symbols": str(cov.get("error_symbols", 0))},
-            total_input_tokens=0, total_output_tokens=0, tasks=[],
+        from sequoia_x import run_weekly_scan, SequoiaScanError
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                run_weekly_scan,
+                days=5, max_symbols=300,
+            ),
+            timeout=SEQUOIA_HARD_TIMEOUT,
         )
-        info = {"receive_id": chat_id, "receive_id_type": "chat_id",
-                "sender_open_id": sender_open_id, "chat_type": chat_type,
-                "target": "A股 Sequoia-X 选股",
-                "preset": "sector_rotation_team",
-                "gurus_override": [], "skip_feishu_card": False}
-        try:
-            await _publish_terminal_run(fake_run, info)
-        except Exception as exc:
-            print(f"[sequoia] publish err {run_id}: "
-                  f"{type(exc).__name__}: {exc}", flush=True)
-            _feishu_send_text(chat_id, "chat_id",
-                f"⚠️ Sequoia-X 扫描完成但 publish 失败:"
-                f"{type(exc).__name__}: {exc}\nrun_id: {run_id}")
-    finally:
-        with _sequoia_in_flight_lock:
-            _sequoia_in_flight.discard(chat_id)
+    except SequoiaScanError as exc:
+        _feishu_send_text(chat_id, "chat_id",
+            f"❌ Sequoia-X 扫描中止:{exc}")
+        return
+    except asyncio.TimeoutError:
+        _feishu_send_text(chat_id, "chat_id",
+            f"❌ Sequoia-X 扫描超过 {SEQUOIA_HARD_TIMEOUT}s 硬超时 — "
+            "可能 sina/eastmoney 接口阻塞,稍后再试。")
+        return
+    except ImportError as exc:
+        _feishu_send_text(chat_id, "chat_id",
+            f"❌ sequoia_x 模块或依赖缺失:{exc}")
+        return
+    except Exception as exc:
+        print(f"[sequoia] unexpected err: {type(exc).__name__}: {exc}",
+              flush=True)
+        _feishu_send_text(chat_id, "chat_id",
+            f"❌ Sequoia-X 扫描失败:{type(exc).__name__}: {exc}")
+        return
+
+    # publish 走标准管道
+    from types import SimpleNamespace
+    run_id = f"sequoia-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(4)}"
+    cov = result.get("coverage", {}) or {}
+    scope = (f"{cov.get('fetched_symbols', '?')}/"
+             f"{cov.get('requested_symbols', '?')}只"
+             f" × {len(result.get('dates', []))}天"
+             f" ({cov.get('elapsed_seconds', '?')}s)")
+    fake_run = SimpleNamespace(
+        id=run_id,
+        status=SimpleNamespace(value="completed"),
+        final_report=result.get("report_markdown") or "(empty report)",
+        preset_name="sector_rotation_team",
+        user_vars={"target": "A股 Sequoia-X 选股", "market": "CN",
+                   "scope": scope,
+                   "error_symbols": str(cov.get("error_symbols", 0))},
+        total_input_tokens=0, total_output_tokens=0, tasks=[],
+    )
+    info = {"receive_id": chat_id, "receive_id_type": "chat_id",
+            "sender_open_id": sender_open_id, "chat_type": chat_type,
+            "target": "A股 Sequoia-X 选股",
+            "preset": "sector_rotation_team",
+            "gurus_override": [], "skip_feishu_card": False}
+    try:
+        await _publish_terminal_run(fake_run, info)
+    except Exception as exc:
+        print(f"[sequoia] publish err {run_id}: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        _feishu_send_text(chat_id, "chat_id",
+            f"⚠️ Sequoia-X 扫描完成但 publish 失败:"
+            f"{type(exc).__name__}: {exc}\nrun_id: {run_id}")
 
 
 async def _feishu_handle_cancel_run(chat_id: str, run_id: str) -> None:
