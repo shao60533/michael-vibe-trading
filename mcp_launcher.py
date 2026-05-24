@@ -3476,8 +3476,10 @@ async def _feishu_handle_message(body: dict):
 
         # ─── routing ───
         if _is_factor_research_request(text):
-            print("[feishu/dispatch] direct industry factor research", flush=True)
-            await _feishu_handle_factor_research(chat_id)
+            print(f"[feishu/dispatch] direct industry factor research "
+                  f"chat={chat_id} sender={sender_open_id[:12]}..", flush=True)
+            await _feishu_handle_factor_research(
+                chat_id, sender_open_id=sender_open_id, chat_type=chat_type)
             return
 
         explicit_preset, cleaned_text = _parse_explicit_preset(text)
@@ -3710,36 +3712,68 @@ async def _fire_swarm(chat_id: str, preset: str, target: str | None,
     )
 
 
-async def _feishu_handle_factor_research(chat_id: str) -> None:
-    """Run the local industry factor module and send a markdown report."""
+async def _feishu_handle_factor_research(chat_id: str,
+                                          sender_open_id: str = "",
+                                          chat_type: str = "") -> None:
+    """Run the local industry factor module, then push through the SAME publish
+    pipeline as a swarm run — DeepSeek-summarized structured card + Feishu docx
+    + Notion page.
+
+    Treated as a `sector_rotation_team` preset (→ macro_theme template), so:
+      - 游资观点 不附加(macro_theme 模板默认不带 youzi)
+      - kv_fields / sections / short_tldr 全部 LLM 抽
+      - 同一格式:卡片(简洁)+ docx(完整)+ Notion(归档)
+    """
     _feishu_send_text(
-        chat_id,
-        "chat_id",
-        "📊 开始跑 A 股行业因子量化分析：行业行情 + LightGBM 预测 + 最近一月回测 + 近一周研报热度。完成后直接推回。",
+        chat_id, "chat_id",
+        "📊 开始跑 A 股行业因子量化分析(行业行情 + LightGBM 预测 + 回测 + 研报热度)\n"
+        "完成后会推回 互动卡片 + 飞书文档 + Notion,约 1-3 分钟。",
     )
     try:
         from factor_analysis import run_industry_factor_research
-
         result = await asyncio.to_thread(
             run_industry_factor_research,
-            lookback_days=260,
-            test_days=22,
-            horizon_days=5,
-            top_k=5,
-            board_limit=80,
-            report_days=7,
+            lookback_days=260, test_days=22, horizon_days=5,
+            top_k=5, board_limit=80, report_days=7,
         )
     except ImportError as exc:
-        _feishu_send_text(
-            chat_id,
-            "chat_id",
-            f"因子模块依赖缺失: {exc}\n请确认部署镜像已安装 pandas / numpy / scikit-learn / lightgbm。",
-        )
+        _feishu_send_text(chat_id, "chat_id",
+            f"❌ 因子模块依赖缺失: {exc}\n请确认部署镜像已装 pandas/numpy/sklearn/lightgbm。")
         return
     except Exception as exc:
-        _feishu_send_text(chat_id, "chat_id", f"因子分析失败: {type(exc).__name__}: {exc}")
+        _feishu_send_text(chat_id, "chat_id",
+            f"❌ 因子分析失败: {type(exc).__name__}: {exc}")
         return
-    _feishu_send_long(chat_id, "chat_id", result["report_markdown"], chunk_size=4500)
+
+    # 合成一个伪 run_id + Run-like 对象,走标准 publish 流水线。
+    # preset=sector_rotation_team → macro_theme 模板 → 适合 industry rotation。
+    from types import SimpleNamespace
+    run_id = f"factor-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(4)}"
+    full_report = result.get("report_markdown") or ""
+    fake_run = SimpleNamespace(
+        id=run_id,
+        status=SimpleNamespace(value="completed"),
+        final_report=full_report,
+        preset_name="sector_rotation_team",
+        user_vars={"target": "A股行业轮动",
+                   "market": "CN",
+                   "model": result.get("model", {}).get("name", "")},
+        total_input_tokens=0,
+        total_output_tokens=0,
+        tasks=[],
+    )
+    info = {"receive_id": chat_id, "receive_id_type": "chat_id",
+            "sender_open_id": sender_open_id, "chat_type": chat_type,
+            "target": "A股行业轮动", "preset": "sector_rotation_team",
+            "gurus_override": [], "skip_feishu_card": False}
+    try:
+        await _publish_terminal_run(fake_run, info)
+    except Exception as exc:
+        print(f"[factor] publish err {run_id}: {type(exc).__name__}: {exc}",
+              flush=True)
+        _feishu_send_text(chat_id, "chat_id",
+            f"⚠️ 因子分析跑完了但 publish 失败: {type(exc).__name__}: {exc}\n"
+            f"run_id: {run_id}")
 
 
 async def _feishu_handle_cancel_run(chat_id: str, run_id: str) -> None:
