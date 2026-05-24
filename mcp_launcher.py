@@ -3401,32 +3401,109 @@ async def feishu_events(request: Request):
 
 
 HELP_TEXT = (
-    "👋 vibe-trading bot 用法\n\n"
-    "🗣️ **直接说人话**——bot 会用 LLM 理解你的意图,不用记格式。例如:\n"
-    "  • 分析苹果 / 看下英伟达 / 茅台怎么样\n"
-    "  • 帮我做小米的风险评估\n"
-    "  • 英伟达最近技术面\n"
-    "  • 茅台季报数据\n"
-    "  • BTC 链上活跃度\n"
-    "  • 半导体板块如何\n"
-    "  • 对比 AAPL 和 MSFT(自动识别为 pairs 配对)\n"
-    "  • SPY 期权策略\n\n"
-    "📊 **历史报告查询**:\n"
-    "  • 最近跑过哪些 / list_runs           列最近 10 个\n"
-    "  • 失败的 run / list_runs failed      按状态过滤\n"
-    "  • 当前在跑的 / list_runs running     看进行中的\n"
-    "  • 最近 5 个 / list_runs 5            限制数量\n"
-    "  • 查一下 <run_id>                    拉完整报告\n"
-    "  • 把最新报告发我 / status latest     最近一次 completed\n\n"
-    "🔧 **运维**:\n"
-    "  • 取消 <run_id> / cancel <run_id>     杀掉卡死的 run\n"
-    "  • 把当前在跑的干掉 / cancel latest    杀最新一个\n\n"
-    "📋 **系统**:\n"
-    "  • presets / 有哪些 preset             列出全部 28 个 preset\n"
-    "  • help / 怎么用                       这条帮助\n\n"
-    "💡 显式指定 preset(高优先级,绕过 LLM):\n"
-    "  • preset:technical_analysis_panel SOXL"
+    "👋 vibe-trading bot — 直接说人话即可,LLM 会理解意图。"
+    "完整说明用富卡片返回,如果你只看到这行纯文本,说明卡片渲染挂了。"
 )
+
+
+_HELP_GITHUB_URL = "https://github.com/shao60533/michael-vibe-trading"
+
+
+def _send_help(chat_id: str) -> None:
+    """发使用说明卡片;若卡片渲染或发送失败,降级到纯文本不至于完全没回应。"""
+    try:
+        card = _build_help_card()
+        _feishu_send_card(chat_id, "chat_id", card)
+        print(f"[feishu/help] sent card to {chat_id}", flush=True)
+    except Exception as e:
+        print(f"[feishu/help] card send failed: {e}, fallback to text",
+              flush=True)
+        try:
+            _feishu_send_text(chat_id, "chat_id",
+                f"{HELP_TEXT}\n\n📦 完整说明: {_HELP_GITHUB_URL}")
+        except Exception as e2:
+            print(f"[feishu/help] text fallback also failed: {e2}", flush=True)
+
+
+def _build_help_card() -> dict:
+    """Render the bot usage guide as a Feishu interactive card.
+
+    内容必须与 README『飞书使用速查』节保持一致 — 它们是同一份内容的两个 surface。
+    """
+    sections = [
+        ("📊 1️⃣ 个股分析",
+         "• `分析苹果` / `看下 NVDA` / `茅台怎么样` — 默认综合投委会\n"
+         "• `英伟达技术面` / `茅台财报` / `小米风险评估` — 自动切对应 preset\n"
+         "• `BTC 链上活跃度` — 加密研究\n"
+         "• `分析 002594,用陈小群` — A 股 + 强制指定游资视角\n"
+         "• `控回撤派看 隆基` — 派别名映射到对应游资"),
+        ("🏢 2️⃣ 行业 / 板块 / 量化",
+         "• `半导体板块` / `光模块怎么样` — swarm 板块轮动分析(慢,5-15 分钟)\n"
+         "• `跑下行业因子量化分析` — LightGBM 行业轮动预测 + 回测(快,1-3 分钟)\n"
+         "• `板块轮动 lightgbm 预测` — 同上"),
+        ("🌲 3️⃣ Sequoia-X 选股",
+         "• `跑下 Sequoia-X 扫描` / `红杉策略选股` — 6 策略 × 活跃 300 只 × 5 天\n"
+         "• `海龟突破` / `RPS 突破` / `涨停洗盘` / `高位窄幅旗形` — 任一关键词都识别\n"
+         "约 1-3 分钟"),
+        ("📋 4️⃣ 历史 / 运维",
+         "• `最近跑过哪些` — 列你自己最近 10 个 run(权限隔离,看不到他人/他群)\n"
+         "• `失败的 run` / `当前在跑的` — 按状态过滤\n"
+         "• `查一下 latest` / `查一下 swarm-xxx` — 拉报告\n"
+         "• `取消 latest` / `取消 swarm-xxx` — 杀掉卡死的\n"
+         "• `presets` / `怎么用` — 查 preset 列表 / 这条帮助"),
+        ("🐊 5️⃣ 10 位游资速查",
+         "**通用**:小鳄鱼(理解力派,默认)\n"
+         "**首板/模式**:北京炒家(模式派)\n"
+         "**龙头**:陈小群(龙头信仰派) / 一瞬流光(高位接力派)\n"
+         "**情绪**:92 科比(情绪周期派)\n"
+         "**资金/低吸**:涅盘重升(资金流派) / 归因(资讯派)\n"
+         "**进攻**:小睿睿(进攻派)\n"
+         "**稳健**:采莲路(控回撤派) / 华东大导弹(低频狙击派)\n"
+         "用法:`用 X 看 Y` 或 `X 派分析 Y`"),
+        ("📤 6️⃣ 输出形式",
+         "每次分析推回三处:\n"
+         "**飞书卡片**(精简,30 秒看完核心)+ **飞书文档**(完整,落「投研文件夹」组织内可见)+ **Notion 归档**(跨平台备份)"),
+        ("⚠️ 注意事项",
+         "• **群权限隔离**:你只能查/取消本群本人的 run,不能跨群\n"
+         "• **部署重启**:服务部署会中断进行中的分析,bot 会主动告知「请重发」\n"
+         "• **数据时效**:免费接口可能延迟或字段口径差异,以官方为准\n"
+         "• **不构成投资建议**:所有输出仅为研究参考"),
+    ]
+    elements: list[dict] = [
+        {"tag": "div",
+         "text": {"tag": "lark_md",
+                  "content": ("📖 **vibe-trading bot 使用速查**\n"
+                              "A 股 / 美港股 / 加密 多市场 AI 投研助手 — 28 个分析师 preset + 10 位游资视角 + 行业因子量化 + Sequoia-X 选股")}},
+    ]
+    for title, body in sections:
+        elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": f"**{title}**\n{body}"},
+        })
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "action",
+        "actions": [{
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "📦 GitHub 仓库 / README"},
+            "url": _HELP_GITHUB_URL,
+            "type": "primary",
+        }],
+    })
+    elements.append({
+        "tag": "note",
+        "elements": [{"tag": "plain_text",
+                      "content": "随时发『怎么用』可再次拉出这张卡"}],
+    })
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "vibe-trading bot · 使用说明"},
+            "template": "blue",
+        },
+        "elements": elements,
+    }
 
 
 def _run_owner(run_id: str) -> tuple[str, str]:
@@ -3543,7 +3620,7 @@ async def _feishu_handle_message(body: dict):
         print(f"[feishu/msg] text(stripped)={text[:120]!r}", flush=True)
         if not text:
             print(f"[feishu/msg] empty text after strip_mentions, send help", flush=True)
-            _feishu_send_text(chat_id, "chat_id", HELP_TEXT)
+            _send_help(chat_id)
             return
 
         # ─── routing ───
@@ -3630,7 +3707,7 @@ async def _feishu_handle_message(body: dict):
                     return
                 await _feishu_handle_cancel_run(chat_id, run_id)
             elif action == "help":
-                _feishu_send_text(chat_id, "chat_id", HELP_TEXT)
+                _send_help(chat_id)
             elif action == "presets":
                 await _feishu_handle_list_presets(chat_id)
             elif action == "clarify":

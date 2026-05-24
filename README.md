@@ -93,26 +93,86 @@ railway logs --service vibe-trading-mcp --build   # build 日志
 - **飞书 run 权限隔离**:`list_runs` / `查一下 latest` / `取消 latest` / 显式 run_id 查询都按 `feishu_meta.json` 里的 `receive_id` + `sender_open_id` 做授权 — 群 A 看不到群 B 的 run,私聊看不到他人的 run,通过 MCP 直接发起(无 feishu_meta)的 run 对所有 Feishu chat 不可见(只能从 `/_debug/republish` 走管理员通道)。
 - **`/_debug/*`**:默认禁用。生效需要 `ENABLE_DEBUG_ENDPOINTS=true` + `ADMIN_AUTH_TOKEN` 都设。mutating 端点(`purge-run` / `republish` / `fix-historic-doc-share`)强制 POST。`fix-historic-doc-share` 的 `entity` 参数有白名单。
 
-## 飞书使用指北
+## 飞书使用速查
 
-bot 用 LLM router 解析自然语言指令，常用形式：
+> 这一节的内容与 bot 在飞书里回应 `help` / `怎么用` 的卡片**完全一致**。改其中一处时同步另一处。
 
-| 指令 | 行为 |
+bot 用 LLM router 解析自然语言指令,**直接说人话即可**。
+
+### 1️⃣ 个股分析
+
+| 你发 | 行为 |
 |------|------|
-| `分析 茅台` / `看下 NVDA` | 默认 `investment_committee` preset |
-| `茅台技术面` / `英伟达 K 线` | 自动切 `technical_analysis_panel` |
+| `分析苹果` / `看下 NVDA` / `茅台怎么样` | 默认综合投委会(`investment_committee`) |
+| `英伟达技术面` | 切 `technical_analysis_panel` |
 | `茅台财报` / `分析下苹果季报` | 切 `earnings_research_desk` |
-| `半导体板块` / `光模块怎么样` | 切 `sector_rotation_team` |
+| `小米风险评估` | 切 `risk_committee` |
 | `BTC 链上活跃度` | 切 `crypto_research_lab` |
-| `用陈小群看 茅台` | A 股分析 + 强制只用陈小群一位游资 |
-| `分析 002594，用北京炒家和小鳄鱼` | 强制用这两位游资 |
-| `控回撤派看 隆基` | 派别名 LLM 自动映射成 xiang-cheng-cai-lian-lu |
-| `最近跑过哪些分析` / `失败的 run` | 列历史 |
-| `查一下 latest` / `查一下 swarm-xxx` | 拉报告 |
-| `取消 swarm-xxx` / `把当前在跑的干掉` | 终止 |
-| `怎么用` / `有哪些 preset` | help |
+| `分析 002594,用陈小群` | A 股 + 强制陈小群游资视角 |
+| `控回撤派看 隆基` | 派别名 LLM 自动映射到对应游资 |
 
-完整支持的 28 个 preset 见 [`mcp_launcher.py`](mcp_launcher.py) 顶部 `KNOWN_PRESETS` 集合，或在飞书发 `presets`。
+### 2️⃣ 行业 / 板块 / 量化
+
+| 你发 | 行为 |
+|------|------|
+| `半导体板块` / `光模块怎么样` | swarm 板块轮动分析(慢,5-15 分钟) |
+| `跑下行业因子量化分析` | LightGBM 行业轮动预测 + 回测(快,1-3 分钟) |
+| `板块轮动 lightgbm 预测` | 同上 |
+
+### 3️⃣ Sequoia-X 选股
+
+| 你发 | 行为 |
+|------|------|
+| `跑下 Sequoia-X 扫描` / `红杉策略选股` | 6 策略 × 活跃 300 只 × 5 天 |
+| `海龟突破` / `RPS 突破` / `涨停洗盘` / `高位窄幅旗形` | 任一关键词都识别 |
+
+约 1-3 分钟,硬超时 5 分钟。
+
+### 4️⃣ 历史 / 运维
+
+| 你发 | 行为 |
+|------|------|
+| `最近跑过哪些` | 列你自己最近 10 个 run(**群权限隔离**,看不到他人/他群) |
+| `失败的 run` / `当前在跑的` | 按状态过滤 |
+| `查一下 latest` / `查一下 swarm-xxx` | 拉报告 |
+| `取消 latest` / `取消 swarm-xxx` | 杀掉卡死的 |
+| `presets` / `怎么用` | 查 preset 列表 / 这条帮助 |
+
+完整 28 个 preset 见 [`mcp_launcher.py`](mcp_launcher.py) 顶部 `KNOWN_PRESETS` 集合。
+
+### 5️⃣ 10 位游资速查
+
+| 派别 | 游资 | 适合 |
+|------|------|------|
+| 理解力派(通用) | 小鳄鱼 | 围绕主流资金 |
+| 模式派 | 北京炒家 | 首板战法 |
+| 龙头信仰派 | 陈小群(群神) | 主升浪龙头 |
+| 高位接力派 | 一瞬流光(光神) | 锁 2 板 |
+| 情绪周期派 | 92 科比 | 高低切 / 情绪 |
+| 资金流派 | 涅盘重升(升大) | 强势形态低吸 |
+| 资讯派 | 归因 | 逻辑驱动低吸 |
+| 进攻派 | 小睿睿(睿神) | 敢上重仓 |
+| 控回撤派 | 采莲路(川哥) | 4 点底线 / 稳健 |
+| 低频狙击派 | 华东大导弹 | 空仓为主 |
+
+用法:`用 X 看 Y` 或 `X 派分析 Y`。不指定时 LLM 自动选 1-2 位互补的派别。
+
+### 6️⃣ 输出形式
+
+每次分析自动推回三处:
+
+1. **飞书互动卡片**(精简,30 秒看完核心)
+2. **飞书云文档**(完整,落「投研文件夹」,组织内可见)
+3. **Notion 归档**(跨平台备份)
+
+A 股 `stock_decision` 类报告下方还有「🐊 游资速看」段(LLM 自选 1-2 位互补派别给一句话 takeaway)。
+
+### ⚠️ 注意事项
+
+- **群权限隔离**:你只能查 / 取消本群本人的 run,不能跨群
+- **部署重启**:服务部署会中断进行中的分析,bot 会主动告知「请重发」
+- **数据时效**:免费接口可能延迟或字段口径差异,以官方为准
+- **不构成投资建议**:所有输出仅为研究参考
 
 ## 游资观点 (10 voice multi-guru)
 
