@@ -21,6 +21,15 @@ cut 版本时把 `[Unreleased]` 整体移到一个带日期的版本号下，再
 
 ### Added
 
+- **`sequoia_x` 包 + MCP tool + 飞书自然语言入口**(A 股 Sequoia-X 6 策略扫描):
+  - skill `sequoia-x-a-share-selector/` 入仓(SKILL.md + references/strategy-map.md + agents/openai.yaml + scripts/sequoia_x_weekly_scan.py + scripts/sequoia_x_monthly_backtest.py)
+  - 新 Python 包 `sequoia_x/` 包装 scripts 为可 import 的 `run_weekly_scan(days, max_symbols, ...)`,SkillsLoader 动态解析 scripts 位置
+  - 新 MCP tool `run_sequoia_x_scan` — 暴露给 Claude Desktop / Code
+  - 飞书自然语言触发:消息含 `sequoia` / `红杉` / `海龟突破` / `RPS 突破` / `涨停洗盘` / `高位窄幅旗形` 等关键词自动识别 → 跑扫描 → 走 `_publish_terminal_run` 推回卡片 + 飞书文档 + Notion
+  - 6 策略:MaVolume / TurtleTrade / HighTightFlag / LimitUpShakeout / UptrendLimitDown / RpsBreakout
+  - **极端情况兜底**:scripts 内部已有 3 次 retry + 东财→新浪 fallback + 全 per-stock try/except。wrapper 额外加:`SequoiaScanError` 翻译三种硬失败(无股池 / 全空 panel / 无最近交易日)、整体 `asyncio.wait_for=300s` 硬超时(`SEQUOIA_HARD_TIMEOUT` env 可调)、per-chat in-flight 去重防止重复触发、partial coverage(error_symbols)透传到卡片
+  - Dockerfile 加 `COPY sequoia_x/ /app/sequoia_x/`,零新 pip 依赖(pandas + urllib 已有)
+
 - **`factor_analysis` 包 + 2 个 MCP tool**(A 股行业因子量化研究):
   - `run_a_share_industry_factor_research` MCP tool — 东财行业板块行情 + QuantsPlaybook 风格量价/择时因子 + LightGBM 预测 + 近期回测 + 研报热度,输出 markdown 报告或 JSON
   - `validate_a_share_february_factor_model` MCP tool — 2 月训练 / 3-5 月验证(no-lookahead)

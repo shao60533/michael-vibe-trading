@@ -1048,6 +1048,66 @@ def validate_a_share_february_factor_model(
     return result["report_markdown"]
 
 
+@mcp_server.mcp.tool()
+def run_sequoia_x_scan(
+    days: int = 5,
+    max_symbols: int = 300,
+    datalen: int = 180,
+    min_amount: float = 100_000_000,
+    rps_threshold: float = 90.0,
+    top_per_strategy: int = 10,
+    pause_seconds: float = 0.03,
+    end_date: str = "",
+    include_st: bool = False,
+    output_format: str = "markdown",
+) -> str:
+    """Run Sequoia-X 6-strategy A-share daily scan over recent trading days.
+
+    Distilled from sngyai/Sequoia-X: MaVolume, TurtleTrade, HighTightFlag,
+    LimitUpShakeout, UptrendLimitDown, RpsBreakout. Uses Eastmoney/Sina active
+    universe and Sina daily kline (amount ≈ close * volume proxy).
+
+    Args:
+        days: Recent trading days to evaluate (default 5).
+        max_symbols: Max universe size (default 300 active by amount).
+        datalen: Per-stock kline history bars (default 180).
+        min_amount: TurtleTrade amount filter (default 1e8 yuan).
+        rps_threshold: RpsBreakout percentile threshold (default 90).
+        top_per_strategy: Top candidates per strategy per day (default 10).
+        pause_seconds: Per-stock fetch delay to avoid rate limits.
+        end_date: Optional YYYY-MM-DD cutoff for evaluation.
+        include_st: Whether to include ST stocks (default false).
+        output_format: "markdown" (human) or "json" (raw dict).
+
+    Returns:
+        Markdown report (compact Chinese) or JSON string.
+    """
+    try:
+        from sequoia_x import run_weekly_scan, SequoiaScanError
+        result = run_weekly_scan(
+            days=days, max_symbols=max_symbols, datalen=datalen,
+            min_amount=min_amount, rps_threshold=rps_threshold,
+            top_per_strategy=top_per_strategy, pause_seconds=pause_seconds,
+            end_date=end_date or None, include_st=include_st,
+        )
+    except SequoiaScanError as exc:
+        return json.dumps(
+            {"status": "error", "error_type": "SequoiaScanError",
+             "error": str(exc)}, ensure_ascii=False)
+    except ImportError as exc:
+        return json.dumps(
+            {"status": "error", "error_type": "ImportError",
+             "error": f"Missing sequoia_x dependency: {exc}"},
+            ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps(
+            {"status": "error", "error_type": type(exc).__name__,
+             "error": str(exc)}, ensure_ascii=False)
+    if output_format.lower() == "json":
+        return json.dumps(result, ensure_ascii=False, default=str)
+    return result["report_markdown"]
+
+
 # ─────────── Feishu integration ───────────
 
 # Tenant token cache (per-process, thread-safe)
@@ -1263,6 +1323,18 @@ def _parse_explicit_preset(text: str) -> tuple[str | None, str]:
 
 def _is_factor_research_request(text: str) -> bool:
     return bool(_FACTOR_RESEARCH_RE.search(text or ""))
+
+
+# Sequoia-X A 股选股扫描 — 6 策略日线
+_SEQUOIA_RE = re.compile(
+    r"sequoia[-\s]?x|sequoia\b|红杉(?:策略|选股|x|扫描)?|海龟突破|"
+    r"RPS\s*突破|涨停洗盘|高(?:位)?(?:窄|紧)幅?旗形",
+    re.I,
+)
+
+
+def _is_sequoia_scan_request(text: str) -> bool:
+    return bool(_SEQUOIA_RE.search(text or ""))
 
 
 # ─────────── LLM-powered intent router (primary path) ───────────
@@ -3482,6 +3554,13 @@ async def _feishu_handle_message(body: dict):
                 chat_id, sender_open_id=sender_open_id, chat_type=chat_type)
             return
 
+        if _is_sequoia_scan_request(text):
+            print(f"[feishu/dispatch] direct sequoia-x scan "
+                  f"chat={chat_id} sender={sender_open_id[:12]}..", flush=True)
+            await _feishu_handle_sequoia_scan(
+                chat_id, sender_open_id=sender_open_id, chat_type=chat_type)
+            return
+
         explicit_preset, cleaned_text = _parse_explicit_preset(text)
         if explicit_preset:
             target, market = _extract_target(cleaned_text)
@@ -3774,6 +3853,101 @@ async def _feishu_handle_factor_research(chat_id: str,
         _feishu_send_text(chat_id, "chat_id",
             f"⚠️ 因子分析跑完了但 publish 失败: {type(exc).__name__}: {exc}\n"
             f"run_id: {run_id}")
+
+
+# Per-chat in-flight set — 同一聊天同时只允许一个 Sequoia-X 扫描在跑。
+# 防止用户连发 / 飞书 retry 导致 2 个并行扫描浪费配额 + 干扰
+_sequoia_in_flight: set[str] = set()
+_sequoia_in_flight_lock = threading.Lock()
+# 整体硬超时 (秒)。Sina/Eastmoney 接口偶发卡死会拖死 worker — 5 分钟兜底。
+SEQUOIA_HARD_TIMEOUT = int(os.environ.get("SEQUOIA_HARD_TIMEOUT", "300"))
+
+
+async def _feishu_handle_sequoia_scan(chat_id: str,
+                                       sender_open_id: str = "",
+                                       chat_type: str = "") -> None:
+    """Run the local Sequoia-X scanner, then push through the SAME publish
+    pipeline as a swarm run (card + 飞书 docx + Notion).
+
+    Hardening:
+      - per-chat in-flight 去重 (同 chat 同时只允许一个 scan)
+      - asyncio.wait_for 300s 硬超时 (防 sina/eastmoney 卡死)
+      - SequoiaScanError / TimeoutError / ImportError / 通用 Exception 分别提示
+    """
+    with _sequoia_in_flight_lock:
+        if chat_id in _sequoia_in_flight:
+            _feishu_send_text(chat_id, "chat_id",
+                "⏳ 本聊天已有 Sequoia-X 扫描在跑,等完成再发新指令。")
+            return
+        _sequoia_in_flight.add(chat_id)
+    try:
+        _feishu_send_text(chat_id, "chat_id",
+            "🌲 开始跑 Sequoia-X A 股选股扫描\n"
+            "(6 策略 × 最近 5 个交易日 × 活跃 300 只,海龟突破 / RPS / 均线放量 / 涨停洗盘 等)\n"
+            f"约 1-3 分钟,硬超时 {SEQUOIA_HARD_TIMEOUT}s,完成后推回 卡片 + 飞书文档 + Notion。")
+        try:
+            from sequoia_x import run_weekly_scan, SequoiaScanError
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    run_weekly_scan,
+                    days=5, max_symbols=300,
+                ),
+                timeout=SEQUOIA_HARD_TIMEOUT,
+            )
+        except SequoiaScanError as exc:
+            _feishu_send_text(chat_id, "chat_id",
+                f"❌ Sequoia-X 扫描中止:{exc}")
+            return
+        except asyncio.TimeoutError:
+            _feishu_send_text(chat_id, "chat_id",
+                f"❌ Sequoia-X 扫描超过 {SEQUOIA_HARD_TIMEOUT}s 硬超时 — "
+                "可能 sina/eastmoney 接口阻塞,稍后再试。")
+            return
+        except ImportError as exc:
+            _feishu_send_text(chat_id, "chat_id",
+                f"❌ sequoia_x 模块或依赖缺失:{exc}")
+            return
+        except Exception as exc:
+            print(f"[sequoia] unexpected err: {type(exc).__name__}: {exc}",
+                  flush=True)
+            _feishu_send_text(chat_id, "chat_id",
+                f"❌ Sequoia-X 扫描失败:{type(exc).__name__}: {exc}")
+            return
+
+        # publish 走标准管道
+        from types import SimpleNamespace
+        run_id = f"sequoia-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(4)}"
+        cov = result.get("coverage", {}) or {}
+        scope = (f"{cov.get('fetched_symbols', '?')}/"
+                 f"{cov.get('requested_symbols', '?')}只"
+                 f" × {len(result.get('dates', []))}天"
+                 f" ({cov.get('elapsed_seconds', '?')}s)")
+        fake_run = SimpleNamespace(
+            id=run_id,
+            status=SimpleNamespace(value="completed"),
+            final_report=result.get("report_markdown") or "(empty report)",
+            preset_name="sector_rotation_team",
+            user_vars={"target": "A股 Sequoia-X 选股", "market": "CN",
+                       "scope": scope,
+                       "error_symbols": str(cov.get("error_symbols", 0))},
+            total_input_tokens=0, total_output_tokens=0, tasks=[],
+        )
+        info = {"receive_id": chat_id, "receive_id_type": "chat_id",
+                "sender_open_id": sender_open_id, "chat_type": chat_type,
+                "target": "A股 Sequoia-X 选股",
+                "preset": "sector_rotation_team",
+                "gurus_override": [], "skip_feishu_card": False}
+        try:
+            await _publish_terminal_run(fake_run, info)
+        except Exception as exc:
+            print(f"[sequoia] publish err {run_id}: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            _feishu_send_text(chat_id, "chat_id",
+                f"⚠️ Sequoia-X 扫描完成但 publish 失败:"
+                f"{type(exc).__name__}: {exc}\nrun_id: {run_id}")
+    finally:
+        with _sequoia_in_flight_lock:
+            _sequoia_in_flight.discard(chat_id)
 
 
 async def _feishu_handle_cancel_run(chat_id: str, run_id: str) -> None:

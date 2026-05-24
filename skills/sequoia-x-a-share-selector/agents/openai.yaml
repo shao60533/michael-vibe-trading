@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sequoia-X A股选股"
+  short_description: "按 Sequoia-X 策略做 A 股日线选股和近期测试。"
+  default_prompt: "用 Sequoia-X 策略扫描 A 股最近一周信号，并说明候选、触发条件和风险。"
