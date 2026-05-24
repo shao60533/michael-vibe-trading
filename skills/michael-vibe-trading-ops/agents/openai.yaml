@@ -1,0 +1,4 @@
+interface:
+  display_name: "Michael Vibe Trading Ops"
+  short_description: "维护和扩展 michael-vibe-trading 项目"
+  default_prompt: "Use $michael-vibe-trading-ops to modify, debug, or deploy the michael-vibe-trading project safely."

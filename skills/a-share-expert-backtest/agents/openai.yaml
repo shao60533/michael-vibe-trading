@@ -1,0 +1,4 @@
+interface:
+  display_name: "A股专家盲测回测"
+  short_description: "A股专家判断历史盲测、回测评估、置信度校准与失败模式分析"
+  default_prompt: "Use $a-share-expert-backtest to evaluate A股专家判断的历史盲测、回测指标和失败模式。"

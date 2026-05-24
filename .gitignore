@@ -7,3 +7,12 @@ __pycache__/
 .idea/
 .vscode/
 *.swp
+
+# Node 包管理(本项目不用 Node,但 collaborator 可能本地装过)
+node_modules/
+
+# 因子分析生成数据(可能 MB 级,不进 repo)
+outputs/
+
+# macOS extended attributes
+__MACOSX/

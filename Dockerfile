@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # Build deps for some scientific wheels (numba/llvmlite, scipy, lxml)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential curl ca-certificates \
+        build-essential curl ca-certificates libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -17,7 +17,11 @@ RUN pip install --no-cache-dir \
     vibe-trading-ai==0.1.6 \
     uvicorn[standard] \
     python-multipart \
-    stockstats
+    stockstats \
+    pandas \
+    numpy \
+    scikit-learn \
+    lightgbm
 
 # a-stock-data skill needs mootdx (TCP 7709 quote client).
 # mootdx pulls httpx[socks]<0.26 which conflicts with langgraph's newer httpx,
@@ -27,6 +31,7 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir --no-deps mootdx pytdx
 
 COPY mcp_launcher.py /app/mcp_launcher.py
+COPY factor_analysis/ /app/factor_analysis/
 
 # Add-on skills (e.g., a-stock-data). Installed into vibe-trading-ai's bundled
 # skills dir so SkillsLoader picks them up regardless of runtime user / HOME.

@@ -952,6 +952,102 @@ def start_swarm_async(preset_name: str, variables: dict[str, str]) -> str:
     }, ensure_ascii=False)
 
 
+@mcp_server.mcp.tool()
+def run_a_share_industry_factor_research(
+    lookback_days: int = 260,
+    test_days: int = 22,
+    horizon_days: int = 5,
+    top_k: int = 5,
+    board_limit: int = 80,
+    report_days: int = 7,
+    panel_csv: str = "",
+    output_format: str = "markdown",
+) -> str:
+    """Run A-share industry factor analysis, LightGBM prediction, and backtest.
+
+    The workflow fetches Eastmoney industry board data, generates
+    QuantsPlaybook-inspired volume-price/timing factors, trains a LightGBM
+    regressor when available, backtests recent industry rotation, pulls recent
+    Eastmoney research reports, and returns integrated industry recommendations.
+
+    Args:
+        lookback_days: Trading-day history used for factor generation.
+        test_days: Recent trading days used as out-of-sample backtest window.
+        horizon_days: Forward return horizon for model label.
+        top_k: Number of industries selected in each rotation basket.
+        board_limit: Max Eastmoney industry boards to fetch.
+        report_days: Recent research report lookback days.
+        panel_csv: Optional local CSV path with date/code/name/open/high/low/close/volume/amount columns.
+        output_format: "markdown" for a human report, "json" for raw details.
+
+    Returns:
+        Markdown report or JSON string with model, backtest, and recommendation
+        details.
+    """
+    try:
+        from factor_analysis import run_industry_factor_research
+
+        result = run_industry_factor_research(
+            lookback_days=lookback_days,
+            test_days=test_days,
+            horizon_days=horizon_days,
+            top_k=top_k,
+            board_limit=board_limit,
+            report_days=report_days,
+            panel_csv=panel_csv or None,
+        )
+    except ImportError as exc:
+        return json.dumps(
+            {
+                "status": "error",
+                "error": f"Missing factor-analysis dependency: {exc}",
+                "tip": "Install pandas, numpy, scikit-learn, and lightgbm in the runtime.",
+            },
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        return json.dumps(
+            {"status": "error", "error": f"{type(exc).__name__}: {exc}"},
+            ensure_ascii=False,
+        )
+    if output_format.lower() == "json":
+        return json.dumps(result, ensure_ascii=False, default=str)
+    return result["report_markdown"]
+
+
+@mcp_server.mcp.tool()
+def validate_a_share_february_factor_model(
+    train_month: str = "2026-02",
+    validate_start: str = "2026-03-01",
+    validate_end: str = "2026-05-24",
+    top_k: int = 5,
+    output_format: str = "markdown",
+) -> str:
+    """Train the new sector-factor model on February 2026 and validate March-May.
+
+    This is a no-lookahead validation: only February rows whose forward labels
+    finish before February month-end are used for training. March-May returns
+    are used only for out-of-sample validation.
+    """
+    try:
+        from factor_analysis import run_february_model_validation
+
+        result = run_february_model_validation(
+            train_month=train_month,
+            validate_start=validate_start,
+            validate_end=validate_end,
+            top_k=top_k,
+        )
+    except Exception as exc:
+        return json.dumps(
+            {"status": "error", "error": f"{type(exc).__name__}: {exc}"},
+            ensure_ascii=False,
+        )
+    if output_format.lower() == "json":
+        return json.dumps(result, ensure_ascii=False, default=str)
+    return result["report_markdown"]
+
+
 # ─────────── Feishu integration ───────────
 
 # Tenant token cache (per-process, thread-safe)
@@ -1147,6 +1243,11 @@ def _classify_preset(text: str, default: str) -> str:
 
 # Explicit preset override: "preset:technical_analysis_panel SOXL" or "/preset xxx"
 _PRESET_OVERRIDE_RE = re.compile(r"(?:preset[:=]\s*|/preset\s+)([a-z_]+)", re.I)
+_FACTOR_RESEARCH_RE = re.compile(
+    r"(?:(?:行业|板块).*(?:因子|量化|lightgbm|机器学习|回测|轮动|预测)"
+    r"|(?:因子|量化|lightgbm|机器学习|回测|轮动|预测).*(?:行业|板块))",
+    re.I,
+)
 
 
 def _parse_explicit_preset(text: str) -> tuple[str | None, str]:
@@ -1158,6 +1259,10 @@ def _parse_explicit_preset(text: str) -> tuple[str | None, str]:
     preset = m.group(1).strip()
     cleaned = (text[:m.start()] + " " + text[m.end():]).strip()
     return preset, cleaned
+
+
+def _is_factor_research_request(text: str) -> bool:
+    return bool(_FACTOR_RESEARCH_RE.search(text or ""))
 
 
 # ─────────── LLM-powered intent router (primary path) ───────────
@@ -3370,6 +3475,11 @@ async def _feishu_handle_message(body: dict):
             return
 
         # ─── routing ───
+        if _is_factor_research_request(text):
+            print("[feishu/dispatch] direct industry factor research", flush=True)
+            await _feishu_handle_factor_research(chat_id)
+            return
+
         explicit_preset, cleaned_text = _parse_explicit_preset(text)
         if explicit_preset:
             target, market = _extract_target(cleaned_text)
@@ -3598,6 +3708,38 @@ async def _fire_swarm(chat_id: str, preset: str, target: str | None,
         f"{head}{guru_line}\n开始分析,预计 5-15 分钟,完成自动推回。\n"
         f"查进度发:查一下 {run.id}",
     )
+
+
+async def _feishu_handle_factor_research(chat_id: str) -> None:
+    """Run the local industry factor module and send a markdown report."""
+    _feishu_send_text(
+        chat_id,
+        "chat_id",
+        "📊 开始跑 A 股行业因子量化分析：行业行情 + LightGBM 预测 + 最近一月回测 + 近一周研报热度。完成后直接推回。",
+    )
+    try:
+        from factor_analysis import run_industry_factor_research
+
+        result = await asyncio.to_thread(
+            run_industry_factor_research,
+            lookback_days=260,
+            test_days=22,
+            horizon_days=5,
+            top_k=5,
+            board_limit=80,
+            report_days=7,
+        )
+    except ImportError as exc:
+        _feishu_send_text(
+            chat_id,
+            "chat_id",
+            f"因子模块依赖缺失: {exc}\n请确认部署镜像已安装 pandas / numpy / scikit-learn / lightgbm。",
+        )
+        return
+    except Exception as exc:
+        _feishu_send_text(chat_id, "chat_id", f"因子分析失败: {type(exc).__name__}: {exc}")
+        return
+    _feishu_send_long(chat_id, "chat_id", result["report_markdown"], chunk_size=4500)
 
 
 async def _feishu_handle_cancel_run(chat_id: str, run_id: str) -> None:

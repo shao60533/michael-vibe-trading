@@ -21,7 +21,19 @@ cut 版本时把 `[Unreleased]` 整体移到一个带日期的版本号下，再
 
 ### Added
 
-- **`STATE_DIR` 持久化状态**:新环境变量,指向 Railway Volume 挂载路径(如 `/app/data`)。设置后,swarm runs(`.swarm/runs/{id}/`,包含报告 + feishu_meta + events)+ OAuth DCR registry(`oauth_clients.json`)落到 Volume,deploy 之间持久保留。不设时退化到 ephemeral 老行为。启动时打 `[boot] STATE_DIR active: ...` 日志。
+- **`factor_analysis` 包 + 2 个 MCP tool**(A 股行业因子量化研究):
+  - `run_a_share_industry_factor_research` MCP tool — 东财行业板块行情 + QuantsPlaybook 风格量价/择时因子 + LightGBM 预测 + 近期回测 + 研报热度,输出 markdown 报告或 JSON
+  - `validate_a_share_february_factor_model` MCP tool — 2 月训练 / 3-5 月验证(no-lookahead)
+  - 飞书自然语言触发:消息匹配「行业/板块 × 因子/量化/lightgbm/回测/轮动/预测」正则自动跑因子分析,结果直接推回(走 `_feishu_handle_factor_research` 文本长消息分块发送,不走 swarm 路径)
+  - Dockerfile 加 `libgomp1` 系统包 + `pandas/numpy/scikit-learn/lightgbm` pip 依赖,`COPY factor_analysis/ /app/`
+- **3 个新 skill**:
+  - `a-share-expert-backtest` — A 股专家历史盲测 / 胜率收益评估(含 references / agents / scripts 子目录)
+  - `michael-vibe-trading-ops` — 维护和扩展本仓库的项目操作技能(meta skill)
+  - `pdf-loader` — PDF 加载与文本抽取(用于研报 / 年报 / SEC filing)
+
+### Fixed
+
+- **LLM JSON 调用全面健壮化**:新环境变量,指向 Railway Volume 挂载路径(如 `/app/data`)。设置后,swarm runs(`.swarm/runs/{id}/`,包含报告 + feishu_meta + events)+ OAuth DCR registry(`oauth_clients.json`)落到 Volume,deploy 之间持久保留。不设时退化到 ephemeral 老行为。启动时打 `[boot] STATE_DIR active: ...` 日志。
 
 ### Changed
 
