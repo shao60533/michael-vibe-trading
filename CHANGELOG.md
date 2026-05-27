@@ -21,6 +21,18 @@ cut 版本时把 `[Unreleased]` 整体移到一个带日期的版本号下，再
 
 ### Added
 
+- **`hot_event_research` 包 + MCP tool + 飞书自然语言入口**(auto-researcher 风格 A 股热点事件深度分析):
+  - 新 Python 包 `hot_event_research/`:`run_hot_event_analysis(event_name)` → markdown 报告
+    - `service.py` 编排:LLM 路由(抽 entity/keywords)→ 抓东财全球资讯 + 关键词过滤 → LLM 主分析按结构化 schema 输出
+    - `data_sources.py` 单独 HTTP 抓取(零新依赖,只用 httpx)
+  - 新 MCP tool `run_hot_event_research(event_name)` — 暴露给 Claude Desktop/Code
+  - 飞书自然语言触发:`热点分析:XXX` / `auto-researcher XXX` / `题材拆解 XXX` / `事件分析:XXX` / `催化分析` / `产业链分析`
+  - 输出 schema:事件概况 / 核心题材逻辑(催化 + 炒作路径)/ 产业链表 / 重点个股 / 预期差 / 风险提示 / 数据证据 / 免责
+  - 走标准 `_publish_terminal_run` 管道:卡片(简洁)+ 飞书 docx(完整,落投研文件夹)+ Notion,preset=event_driven_task_force → macro_theme 模板
+  - **兜底**:路由失败 fallback、新闻抓取失败降级到「无数据上下文」纯框架分析、主分析失败抛 HotEventError、整体 180s 硬超时(`HOT_EVENT_TIMEOUT` env 可调)、数据稀薄时 LLM 在「数据证据」段明确告知
+  - 个股代码强制 6 位 + .SH/.SZ 格式,prompt 明确禁止 hallucinate
+  - run_id 前缀 `hotevent-{ts}-{hex}` 便于日志检索
+
 - **`sequoia_x` 包 + MCP tool + 飞书自然语言入口**(A 股 Sequoia-X 6 策略扫描):
   - skill `sequoia-x-a-share-selector/` 入仓(SKILL.md + references/strategy-map.md + agents/openai.yaml + scripts/sequoia_x_weekly_scan.py + scripts/sequoia_x_monthly_backtest.py)
   - 新 Python 包 `sequoia_x/` 包装 scripts 为可 import 的 `run_weekly_scan(days, max_symbols, ...)`,SkillsLoader 动态解析 scripts 位置

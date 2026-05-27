@@ -1108,6 +1108,50 @@ def run_sequoia_x_scan(
     return result["report_markdown"]
 
 
+@mcp_server.mcp.tool()
+def run_hot_event_research(
+    event_name: str,
+    output_format: str = "markdown",
+) -> str:
+    """Auto-researcher style A-share hot-event deep analysis.
+
+    Pipeline: LLM 路由抽 entity + keywords → 抓东财全球资讯近期新闻按 keyword
+    过滤 → LLM 主分析按结构化模板输出(事件概况 / 核心题材逻辑 / 产业链 /
+    重点个股 / 预期差 / 风险提示 / 数据证据)。
+
+    Args:
+        event_name: Event name in Chinese, e.g. "华为韬定律" / "锂电池价格回升" /
+                    "AI 应用变现" / "上市公司董事长违规减持". Free form.
+        output_format: "markdown" (human report) or "json" (raw dict with coverage).
+
+    Returns:
+        Structured markdown report or JSON string.
+    """
+    if not event_name or not event_name.strip():
+        return json.dumps(
+            {"status": "error", "error": "event_name required (non-empty)"},
+            ensure_ascii=False)
+    try:
+        from hot_event_research import run_hot_event_analysis, HotEventError
+        result = run_hot_event_analysis(event_name.strip())
+    except HotEventError as exc:
+        return json.dumps(
+            {"status": "error", "error_type": "HotEventError",
+             "error": str(exc)}, ensure_ascii=False)
+    except ImportError as exc:
+        return json.dumps(
+            {"status": "error", "error_type": "ImportError",
+             "error": f"Missing hot_event_research: {exc}"},
+            ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps(
+            {"status": "error", "error_type": type(exc).__name__,
+             "error": str(exc)}, ensure_ascii=False)
+    if output_format.lower() == "json":
+        return json.dumps(result, ensure_ascii=False, default=str)
+    return result["report_markdown"]
+
+
 # ─────────── Feishu integration ───────────
 
 # Tenant token cache (per-process, thread-safe)
@@ -1335,6 +1379,30 @@ _SEQUOIA_RE = re.compile(
 
 def _is_sequoia_scan_request(text: str) -> bool:
     return bool(_SEQUOIA_RE.search(text or ""))
+
+
+# 热点事件深度分析 (auto-researcher 风格)
+_HOT_EVENT_RE = re.compile(
+    r"auto[-\s]?researcher|热点(?:分析|深度|拆解|解读|事件)[\s::]?"
+    r"|事件分析[\s::]?|事件驱动分析|题材(?:拆解|分析|解读)[\s::]?"
+    r"|催化分析[\s::]?|产业链分析[\s::]?",
+    re.I,
+)
+
+
+def _parse_hot_event_request(text: str) -> tuple[bool, str]:
+    """Detect hot-event trigger + extract event name (everything around it).
+
+    Returns (is_hot_event, event_name_extracted).
+    event_name 是触发词以外的内容,去除前后标点。
+    """
+    m = _HOT_EVENT_RE.search(text or "")
+    if not m:
+        return False, ""
+    # 触发词前后的内容都可能是事件名,拼起来再去重 punctuation
+    rest = ((text[:m.start()] or "") + " " + (text[m.end():] or ""))
+    rest = re.sub(r"\s+", " ", rest).strip(" \t\n:：,，。.「」『』\"'")
+    return True, rest
 
 
 # ─────────── LLM-powered intent router (primary path) ───────────
@@ -3445,6 +3513,11 @@ def _build_help_card() -> dict:
          "• `跑下 Sequoia-X 扫描` / `红杉策略选股` — 6 策略 × 活跃 300 只 × 5 天\n"
          "• `海龟突破` / `RPS 突破` / `涨停洗盘` / `高位窄幅旗形` — 任一关键词都识别\n"
          "约 1-3 分钟"),
+        ("🔬 3️⃣b 热点事件深度分析 (auto-researcher)",
+         "• `热点分析:华为韬定律` / `auto-researcher 锂电池价格回升`\n"
+         "• `题材拆解 半导体先进封装` / `事件分析:AI 应用变现`\n"
+         "流程:LLM 解析事件 → 抓东财近期新闻 → 结构化分析(产业链/核心股/预期差/风险)。"
+         "数据稀薄时会明确告知「证据较弱」。约 1-3 分钟"),
         ("📋 4️⃣ 历史 / 运维",
          "• `最近跑过哪些` — 列你自己最近 10 个 run(权限隔离,看不到他人/他群)\n"
          "• `失败的 run` / `当前在跑的` — 按状态过滤\n"
@@ -3636,6 +3709,15 @@ async def _feishu_handle_message(body: dict):
                   f"chat={chat_id} sender={sender_open_id[:12]}..", flush=True)
             await _feishu_handle_sequoia_scan(
                 chat_id, sender_open_id=sender_open_id, chat_type=chat_type)
+            return
+
+        is_hot, event_name = _parse_hot_event_request(text)
+        if is_hot:
+            print(f"[feishu/dispatch] hot event research "
+                  f"event={event_name!r} chat={chat_id}", flush=True)
+            await _feishu_handle_hot_event_research(
+                chat_id, event_name=event_name,
+                sender_open_id=sender_open_id, chat_type=chat_type)
             return
 
         explicit_preset, cleaned_text = _parse_explicit_preset(text)
@@ -4010,6 +4092,92 @@ async def _feishu_handle_sequoia_scan(chat_id: str,
               f"{type(exc).__name__}: {exc}", flush=True)
         _feishu_send_text(chat_id, "chat_id",
             f"⚠️ Sequoia-X 扫描完成但 publish 失败:"
+            f"{type(exc).__name__}: {exc}\nrun_id: {run_id}")
+
+
+# 热点事件分析硬超时(秒)。LLM 主分析最大 ~60s + 新闻抓取 ~10s + 路由 ~10s,
+# 整体 180s 足够,避免接口抽风拖死。
+HOT_EVENT_HARD_TIMEOUT = int(os.environ.get("HOT_EVENT_TIMEOUT", "180"))
+
+
+async def _feishu_handle_hot_event_research(chat_id: str,
+                                             event_name: str,
+                                             sender_open_id: str = "",
+                                             chat_type: str = "") -> None:
+    """Run hot-event analysis, publish through 标准 publish 管道.
+
+    并发模型同 sequoia:无 dedup,各 chat 独立超时兜底。
+    缺事件名时引导用户重新发。
+    """
+    if not event_name:
+        _feishu_send_text(chat_id, "chat_id",
+            "🔬 auto-researcher 用法:发『**热点分析:XXX**』或『**auto-researcher XXX**』指定事件。例如:\n"
+            "  • `热点分析:华为韬定律`\n"
+            "  • `auto-researcher 锂电池价格回升`\n"
+            "  • `题材拆解 半导体先进封装`\n"
+            "  • `事件分析:AI 应用变现`")
+        return
+
+    _feishu_send_text(chat_id, "chat_id",
+        f"🔬 开始研究热点事件:**{event_name}**\n"
+        "步骤:LLM 解析 → 抓近期相关新闻 → 结构化分析(产业链 / 核心股 / 预期差)\n"
+        f"约 1-3 分钟,硬超时 {HOT_EVENT_HARD_TIMEOUT}s,完成后推回 卡片 + 飞书文档 + Notion。")
+    try:
+        from hot_event_research import run_hot_event_analysis, HotEventError
+        result = await asyncio.wait_for(
+            asyncio.to_thread(run_hot_event_analysis, event_name),
+            timeout=HOT_EVENT_HARD_TIMEOUT,
+        )
+    except HotEventError as exc:
+        _feishu_send_text(chat_id, "chat_id",
+            f"❌ 事件分析中止:{exc}")
+        return
+    except asyncio.TimeoutError:
+        _feishu_send_text(chat_id, "chat_id",
+            f"❌ 事件分析超过 {HOT_EVENT_HARD_TIMEOUT}s 硬超时 — "
+            "可能 DeepSeek 接口阻塞,稍后再试。")
+        return
+    except ImportError as exc:
+        _feishu_send_text(chat_id, "chat_id",
+            f"❌ hot_event_research 模块或依赖缺失:{exc}")
+        return
+    except Exception as exc:
+        print(f"[hot-event] unexpected err: {type(exc).__name__}: {exc}",
+              flush=True)
+        _feishu_send_text(chat_id, "chat_id",
+            f"❌ 事件分析失败:{type(exc).__name__}: {exc}")
+        return
+
+    # publish 走标准管道
+    from types import SimpleNamespace
+    run_id = f"hotevent-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(4)}"
+    cov = result.get("coverage", {}) or {}
+    routed = result.get("routed", {}) or {}
+    scope = (f"news {cov.get('news_fetched', 0)}条"
+             f"{' · 抓取失败' if cov.get('news_error') else ''}"
+             f" ({cov.get('elapsed_seconds', '?')}s)")
+    fake_run = SimpleNamespace(
+        id=run_id,
+        status=SimpleNamespace(value="completed"),
+        final_report=result.get("report_markdown") or "(empty)",
+        preset_name="event_driven_task_force",
+        user_vars={"target": event_name, "market": "CN",
+                   "scope": scope,
+                   "industry_hint": routed.get("industry_hint", "")},
+        total_input_tokens=0, total_output_tokens=0, tasks=[],
+    )
+    info = {"receive_id": chat_id, "receive_id_type": "chat_id",
+            "sender_open_id": sender_open_id, "chat_type": chat_type,
+            "target": event_name,
+            "preset": "event_driven_task_force",
+            "gurus_override": [], "skip_feishu_card": False}
+    try:
+        await _publish_terminal_run(fake_run, info)
+    except Exception as exc:
+        print(f"[hot-event] publish err {run_id}: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        _feishu_send_text(chat_id, "chat_id",
+            f"⚠️ 事件分析完成但 publish 失败:"
             f"{type(exc).__name__}: {exc}\nrun_id: {run_id}")
 
 
