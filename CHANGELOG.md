@@ -21,6 +21,13 @@ cut 版本时把 `[Unreleased]` 整体移到一个带日期的版本号下，再
 
 ### Added
 
+- **每日定时热点事件推送**:
+  - 新增 `_daily_hot_event_scheduler` 进程内 asyncio 后台任务,启动时 `asyncio.create_task` 拉起
+  - 默认北京时间 **10:00 + 15:00** 各推一条:bot 从近期新闻流挑当日最值得做产业链拆解的事件,跑标准 hot_event_research 分析,推送到指定群(卡片 + 飞书 docx + Notion)
+  - 配置 env vars:`DAILY_HOT_EVENT_CHAT_ID`(必填,空则禁用)、`DAILY_HOT_EVENT_HOURS=10,15`、`DAILY_HOT_EVENT_TZ_OFFSET=8`
+  - `pick_daily_event_name()` 让 LLM 按优先级(政策 > 技术突破 > 龙头动作 > 板块异动)从新闻流挑题,失败 fallback 到「今日 A 股热点」
+  - 单次 push 失败不影响下次调度;容器重启时间窗 ±1min 卡在调度点会漏该次,不补推
+
 - **`hot_event_research` 包 + MCP tool + 飞书自然语言入口**(auto-researcher 风格 A 股热点事件深度分析):
   - 新 Python 包 `hot_event_research/`:`run_hot_event_analysis(event_name)` → markdown 报告
     - `service.py` 编排:LLM 路由(抽 entity/keywords)→ 抓东财全球资讯 + 关键词过滤 → LLM 主分析按结构化 schema 输出

@@ -203,6 +203,84 @@ def _main_analysis(event_name: str,
     return content
 
 
+def pick_daily_event_name() -> str:
+    """让 LLM 从今日新闻流里挑一个最值得做 A 股产业链拆解的事件。
+
+    返回事件名(str)。失败时降级到通用 fallback,不抛异常 — 调度器希望
+    无论如何能跑下去。
+    """
+    fallback = "今日 A 股热点"
+    try:
+        news = data_sources.fetch_global_news(page_size=120)
+    except Exception as exc:
+        print(f"[hot-event/pick] news fetch failed: {type(exc).__name__}: {exc}",
+              flush=True)
+        return f"{fallback}(数据稀薄)"
+    if not news:
+        return f"{fallback}(无新闻)"
+
+    api_key, base_url, model = _llm_creds()
+    if not api_key:
+        return fallback
+
+    headlines = "\n".join(
+        f"[{n.get('time', '')}] {(n.get('title') or '').strip()}"
+        for n in news[:60]
+    )
+    sysprompt = (
+        "你是 A 股选题编辑。从今日新闻流里挑一个**最值得做产业链拆解**的事件。\n\n"
+        "返回严格 JSON:\n"
+        '{"event_name": "<8-25 字事件名>", "reason": "<30 字以内选择理由>"}\n\n'
+        "硬规则:\n"
+        "- 选有 A 股产业链联动 + 短期催化效应的事件\n"
+        "- 优先级:政策利好 > 技术突破 > 龙头公司动作 > 板块异动\n"
+        "- 避免选纯宏观财经(PMI / CPI / 美联储议息)、单独港股 / 美股事件 — 不便于做 A 股产业链分析\n"
+        "- event_name 要短、具体、可分析,如「华为韬定律」「锂电池价格回升」「AI 应用变现」「光模块涨价」\n"
+        "- 多个候选时,选 A 股市场影响力最大的"
+    )
+    user_msg = f"今日新闻流(取前 60 条):\n\n{headlines}"
+    body = {
+        "model": model,
+        "messages": [{"role": "system", "content": sysprompt},
+                     {"role": "user", "content": user_msg}],
+        "response_format": {"type": "json_object"},
+        "max_tokens": 800,
+        "temperature": 0.2,
+    }
+    try:
+        with httpx.Client(
+            timeout=httpx.Timeout(connect=10, read=60, write=15, pool=5),
+        ) as c:
+            r = c.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}",
+                         "Content-Type": "application/json"},
+                json=body,
+            )
+        if r.status_code != 200:
+            print(f"[hot-event/pick] HTTP {r.status_code}: {r.text[:200]}",
+                  flush=True)
+            return fallback
+        d = r.json()
+        msg = (d.get("choices") or [{}])[0].get("message") or {}
+        content = (msg.get("content") or "").strip()
+        m = re.search(r"\{[\s\S]*\}", content)
+        if not m:
+            return fallback
+        parsed = json.loads(m.group(0))
+        event_name = (parsed.get("event_name") or "").strip()
+        reason = (parsed.get("reason") or "").strip()
+        if not event_name:
+            return fallback
+        print(f"[hot-event/pick] selected event={event_name!r} reason={reason!r}",
+              flush=True)
+        return event_name
+    except Exception as exc:
+        print(f"[hot-event/pick] exception: {type(exc).__name__}: {exc}",
+              flush=True)
+        return fallback
+
+
 def run_hot_event_analysis(event_name: str) -> dict[str, Any]:
     """Entry point. 返回 {event_name, routed, coverage, news_sample,
     report_markdown}。失败抛 HotEventError。"""

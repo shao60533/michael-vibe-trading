@@ -4099,6 +4099,24 @@ async def _feishu_handle_sequoia_scan(chat_id: str,
 # 整体 180s 足够,避免接口抽风拖死。
 HOT_EVENT_HARD_TIMEOUT = int(os.environ.get("HOT_EVENT_TIMEOUT", "180"))
 
+# ── 每日定时热点推送配置 ──
+# DAILY_HOT_EVENT_CHAT_ID: 推送目标飞书 chat_id (oc_xxx)。空则禁用 scheduler
+# DAILY_HOT_EVENT_HOURS: 逗号分隔小时(默认 "10,15",即北京时间 10:00 + 15:00)
+# DAILY_HOT_EVENT_TZ_OFFSET: 时区偏移小时(默认 8,北京)
+DAILY_HOT_EVENT_CHAT_ID = os.environ.get("DAILY_HOT_EVENT_CHAT_ID", "").strip()
+_DAILY_HOURS_RAW = os.environ.get("DAILY_HOT_EVENT_HOURS", "10,15").strip()
+try:
+    DAILY_HOT_EVENT_HOURS = sorted({
+        int(h.strip()) for h in _DAILY_HOURS_RAW.split(",")
+        if h.strip().isdigit() and 0 <= int(h.strip()) <= 23
+    })
+except Exception:
+    DAILY_HOT_EVENT_HOURS = [10, 15]
+try:
+    DAILY_HOT_EVENT_TZ_OFFSET = int(os.environ.get("DAILY_HOT_EVENT_TZ_OFFSET", "8"))
+except Exception:
+    DAILY_HOT_EVENT_TZ_OFFSET = 8
+
 
 async def _feishu_handle_hot_event_research(chat_id: str,
                                              event_name: str,
@@ -4179,6 +4197,80 @@ async def _feishu_handle_hot_event_research(chat_id: str,
         _feishu_send_text(chat_id, "chat_id",
             f"⚠️ 事件分析完成但 publish 失败:"
             f"{type(exc).__name__}: {exc}\nrun_id: {run_id}")
+
+
+# ── 每日定时热点推送(进程内 asyncio scheduler) ──
+
+def _next_daily_push_dt(hours: list[int], tz_offset: int):
+    """Return next scheduled datetime (tz-aware in given offset)."""
+    import datetime
+    tz = datetime.timezone(datetime.timedelta(hours=tz_offset))
+    now = datetime.datetime.now(tz)
+    candidates: list[datetime.datetime] = []
+    for h in hours:
+        today = now.replace(hour=h, minute=0, second=0, microsecond=0)
+        if today > now:
+            candidates.append(today)
+        else:
+            candidates.append(today + datetime.timedelta(days=1))
+    return min(candidates)
+
+
+async def _do_daily_hot_event_push(chat_id: str) -> None:
+    """选今日热点 + 跑分析 + 推送。复用现有 _feishu_handle_hot_event_research。"""
+    print(f"[scheduler] daily push start chat={chat_id}", flush=True)
+    try:
+        from hot_event_research.service import pick_daily_event_name
+        event_name = await asyncio.to_thread(pick_daily_event_name)
+    except Exception as exc:
+        print(f"[scheduler] pick_daily_event_name failed: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        event_name = "今日 A 股热点(自动挑选失败)"
+    print(f"[scheduler] picked event: {event_name!r}", flush=True)
+    await _feishu_handle_hot_event_research(
+        chat_id, event_name=event_name,
+        sender_open_id="", chat_type="",
+    )
+
+
+async def _daily_hot_event_scheduler() -> None:
+    """Background task — 每天指定北京时间小时推送一条热点事件分析。
+
+    重启 edge case:容器在调度点附近 (~分钟级) 重启会漏过这次推送,
+    新容器计算下一个调度点;接受这一损失,不补推。
+    """
+    if not DAILY_HOT_EVENT_CHAT_ID:
+        print("[scheduler] DAILY_HOT_EVENT_CHAT_ID 未设,每日热点推送禁用",
+              flush=True)
+        return
+    if not DAILY_HOT_EVENT_HOURS:
+        print("[scheduler] DAILY_HOT_EVENT_HOURS 为空,每日热点推送禁用",
+              flush=True)
+        return
+    print(f"[scheduler] daily hot-event push 启用: "
+          f"chat={DAILY_HOT_EVENT_CHAT_ID} "
+          f"hours={DAILY_HOT_EVENT_HOURS} (UTC+{DAILY_HOT_EVENT_TZ_OFFSET})",
+          flush=True)
+    import datetime
+    while True:
+        next_run = _next_daily_push_dt(DAILY_HOT_EVENT_HOURS,
+                                       DAILY_HOT_EVENT_TZ_OFFSET)
+        now = datetime.datetime.now(next_run.tzinfo)
+        wait_sec = max(1.0, (next_run - now).total_seconds())
+        print(f"[scheduler] next push at {next_run.isoformat()} "
+              f"(wait {wait_sec:.0f}s)", flush=True)
+        try:
+            await asyncio.sleep(wait_sec)
+        except asyncio.CancelledError:
+            print("[scheduler] cancelled, exiting", flush=True)
+            return
+        try:
+            await _do_daily_hot_event_push(DAILY_HOT_EVENT_CHAT_ID)
+        except Exception as exc:
+            print(f"[scheduler] push failed at {next_run.isoformat()}: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+        # 多 sleep 几秒避免「同一小时被算成下次最近」二次触发
+        await asyncio.sleep(60)
 
 
 async def _feishu_handle_cancel_run(chat_id: str, run_id: str) -> None:
@@ -4417,6 +4509,8 @@ async def _lifespan(app):
                 print(f"[feishu] notion sync: enabled ({parent_desc})", flush=True)
             else:
                 print("[feishu] notion sync: disabled", flush=True)
+            # 启动每日热点推送 scheduler (仅当 DAILY_HOT_EVENT_CHAT_ID 已设)
+            asyncio.create_task(_daily_hot_event_scheduler())
         else:
             print("[feishu] disabled (LARK_APP_ID/SECRET not set)", flush=True)
         try:
