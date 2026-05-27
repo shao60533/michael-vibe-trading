@@ -203,11 +203,15 @@ def _main_analysis(event_name: str,
     return content
 
 
-def pick_daily_event_name() -> str:
+def pick_daily_event_name(avoid_recent: list[str] | None = None) -> str:
     """让 LLM 从今日新闻流里挑一个最值得做 A 股产业链拆解的事件。
 
-    返回事件名(str)。失败时降级到通用 fallback,不抛异常 — 调度器希望
-    无论如何能跑下去。
+    Args:
+        avoid_recent: 最近已推过的 event_name 列表(scheduler 持有),让 LLM
+                      尽量挑不重复的。空列表 / None 时不加约束。
+    Returns:
+        事件名(str)。失败时降级到通用 fallback,不抛异常 — 调度器希望
+        无论如何能跑下去。
     """
     fallback = "今日 A 股热点"
     try:
@@ -227,6 +231,17 @@ def pick_daily_event_name() -> str:
         f"[{n.get('time', '')}] {(n.get('title') or '').strip()}"
         for n in news[:60]
     )
+
+    avoid_block = ""
+    recent_clean = [n.strip() for n in (avoid_recent or []) if n and n.strip()]
+    if recent_clean:
+        names = "\n".join(f"- {n}" for n in recent_clean[-5:])
+        avoid_block = (
+            f"\n\n最近已推过的事件(请优先避免重复):\n{names}\n"
+            "若今日确实没有新热点,允许选相同事件,但 reason 段说明"
+            "「无新热点,延续此前事件」。"
+        )
+
     sysprompt = (
         "你是 A 股选题编辑。从今日新闻流里挑一个**最值得做产业链拆解**的事件。\n\n"
         "返回严格 JSON:\n"
@@ -237,6 +252,7 @@ def pick_daily_event_name() -> str:
         "- 避免选纯宏观财经(PMI / CPI / 美联储议息)、单独港股 / 美股事件 — 不便于做 A 股产业链分析\n"
         "- event_name 要短、具体、可分析,如「华为韬定律」「锂电池价格回升」「AI 应用变现」「光模块涨价」\n"
         "- 多个候选时,选 A 股市场影响力最大的"
+        + avoid_block
     )
     user_msg = f"今日新闻流(取前 60 条):\n\n{headlines}"
     body = {

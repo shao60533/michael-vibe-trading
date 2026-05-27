@@ -4216,17 +4216,33 @@ def _next_daily_push_dt(hours: list[int], tz_offset: int):
     return min(candidates)
 
 
+# Scheduler 维护最近挑过的事件名,避免上午挑了「华为韬定律」下午再挑一次。
+# 进程内 in-memory,容器重启会丢(可接受 — 重启不频繁,丢了重复一次最多)。
+# 不持久化是有意的:跨 deploy 重置反而能避免「持续推同一个停滞事件」。
+_scheduler_recent_picks: list[str] = []
+_SCHEDULER_RECENT_MAX = 5
+_scheduler_recent_lock = threading.Lock()
+
+
 async def _do_daily_hot_event_push(chat_id: str) -> None:
     """选今日热点 + 跑分析 + 推送。复用现有 _feishu_handle_hot_event_research。"""
     print(f"[scheduler] daily push start chat={chat_id}", flush=True)
+    with _scheduler_recent_lock:
+        recent_snapshot = list(_scheduler_recent_picks)
     try:
         from hot_event_research.service import pick_daily_event_name
-        event_name = await asyncio.to_thread(pick_daily_event_name)
+        event_name = await asyncio.to_thread(pick_daily_event_name, recent_snapshot)
     except Exception as exc:
         print(f"[scheduler] pick_daily_event_name failed: "
               f"{type(exc).__name__}: {exc}", flush=True)
         event_name = "今日 A 股热点(自动挑选失败)"
-    print(f"[scheduler] picked event: {event_name!r}", flush=True)
+    print(f"[scheduler] picked event: {event_name!r} "
+          f"(avoid {len(recent_snapshot)} recent)", flush=True)
+    # 记录这次的 pick,即便后续 publish 失败 — 选了同一个再推没意义
+    with _scheduler_recent_lock:
+        _scheduler_recent_picks.append(event_name)
+        if len(_scheduler_recent_picks) > _SCHEDULER_RECENT_MAX:
+            _scheduler_recent_picks.pop(0)
     await _feishu_handle_hot_event_research(
         chat_id, event_name=event_name,
         sender_open_id="", chat_type="",
