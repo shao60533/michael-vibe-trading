@@ -4193,9 +4193,14 @@ async def _feishu_handle_sequoia_scan(chat_id: str,
 # 整体 180s 足够,避免接口抽风拖死。
 HOT_EVENT_HARD_TIMEOUT = int(os.environ.get("HOT_EVENT_TIMEOUT", "180"))
 
-# KHunter pipeline 硬超时(秒)— scan ~1-3min + 因子 ~10s + 辩论 top10 并行 ~2min。
-# 默认 600s 给容错空间;DeepSeek 偶发慢可吃。
-KHUNTER_HARD_TIMEOUT = int(os.environ.get("KHUNTER_HARD_TIMEOUT", "600"))
+# KHunter pipeline 硬超时(秒)。swarm 模式 Top10 串行:每只 swarm 真投委会 ~10-15
+# 分钟,加 scan+因子 ~5 分钟,默认 14400s (4 小时)给充分余量。LLM 模式只需 600s。
+KHUNTER_HARD_TIMEOUT = int(os.environ.get("KHUNTER_HARD_TIMEOUT", "14400"))
+# 辩论模式: swarm (真实 investment_committee 串行) | llm (单 LLM 调用并行,快)
+KHUNTER_DEBATE_MODE = os.environ.get("KHUNTER_DEBATE_MODE", "swarm").strip().lower()
+# swarm 模式下单只股的 timeout
+KHUNTER_SWARM_TIMEOUT_PER_RUN = int(
+    os.environ.get("KHUNTER_SWARM_TIMEOUT_PER_RUN", "1800"))
 
 
 async def _feishu_handle_khunter_pipeline(chat_id: str,
@@ -4207,23 +4212,48 @@ async def _feishu_handle_khunter_pipeline(chat_id: str,
     """完整 KHunter daily pipeline + 标准 publish。
 
     流程:
-      1. ack 飞书
+      1. ack 飞书 + 跟用户说明本次模式 / 预期耗时
       2. asyncio.wait_for(KHunter pipeline) — scan + factor + debate + 写 outputs/
+         辩论中每 2 只股发一条进度 ack(swarm 模式才发,避免 LLM 模式快没必要)
       3. 走 _publish_terminal_run 推卡片 / docx / Notion
       4. 写 feishu_status.json 记录结果
-
-    feishu_status.json 落在 outputs/{date}-khunter-a-share-daily/ 下。
     """
+    if KHUNTER_DEBATE_MODE == "swarm":
+        est = f"约 {top_n} × 10-15 分钟 swarm 串行 + 扫描 5 分钟 ≈ 2-3 小时"
+    else:
+        est = "约 3-6 分钟"
     _feishu_send_text(chat_id, "chat_id",
         f"🎯 开始 KHunter A 股日报 pipeline\n"
-        f"(11 策略扫描 {max_symbols} 只 × {days} 天 → 个股因子评分 → 多专家辩论 Top{top_n})\n"
-        f"约 3-6 分钟,硬超时 {KHUNTER_HARD_TIMEOUT}s,完成后推回 卡片 + 飞书文档 + Notion。")
+        f"(11 策略扫描 {max_symbols} 只 × {days} 天 → 个股因子评分 → "
+        f"多专家辩论 Top{top_n} [{KHUNTER_DEBATE_MODE} 模式])\n"
+        f"{est},硬超时 {KHUNTER_HARD_TIMEOUT}s,完成后推回 卡片 + 飞书文档 + Notion。"
+        f"\n中途会发进度更新,慢慢跑请稍等。")
+
+    # 进度回调 — swarm 模式每 2 只发一条
+    last_progress: dict = {"sent_at_idx": 0}
+    async def _progress_cb(idx: int, total: int, code: str, name: str,
+                            status: str, elapsed: float) -> None:
+        # 每 2 只 或 最后一只 发
+        if idx - last_progress["sent_at_idx"] < 2 and idx != total:
+            return
+        last_progress["sent_at_idx"] = idx
+        emoji = "✅" if status == "completed" else "⚠️"
+        try:
+            _feishu_send_text(chat_id, "chat_id",
+                f"🎯 KHunter 辩论进度 {idx}/{total}  "
+                f"{emoji} {code} {name} ({status}, {elapsed:.0f}s)")
+        except Exception as exc:
+            print(f"[khunter] progress send err: {exc}", flush=True)
+
     try:
         from khunter_x import run_khunter_pipeline_async, KHunterScanError
         result = await asyncio.wait_for(
             run_khunter_pipeline_async(
                 days=days, max_symbols=max_symbols, top_n=top_n,
                 enable_debate=True, write_files=True,
+                debate_mode=KHUNTER_DEBATE_MODE,
+                swarm_timeout_per_run=KHUNTER_SWARM_TIMEOUT_PER_RUN,
+                progress_callback=_progress_cb,
             ),
             timeout=KHUNTER_HARD_TIMEOUT,
         )
@@ -4233,7 +4263,9 @@ async def _feishu_handle_khunter_pipeline(chat_id: str,
         return
     except asyncio.TimeoutError:
         _feishu_send_text(chat_id, "chat_id",
-            f"❌ KHunter pipeline 超过 {KHUNTER_HARD_TIMEOUT}s 硬超时 — 稍后再试。")
+            f"❌ KHunter pipeline 超过 {KHUNTER_HARD_TIMEOUT}s 硬超时 — 稍后再试。\n"
+            f"提示:swarm 模式跑 Top10 真投委会需 2-3 小时,如非必要可改 "
+            f"KHUNTER_DEBATE_MODE=llm 提速到 5 分钟。")
         return
     except ImportError as exc:
         _feishu_send_text(chat_id, "chat_id",

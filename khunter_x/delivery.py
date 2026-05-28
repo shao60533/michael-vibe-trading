@@ -383,10 +383,20 @@ def build_report_markdown(
 
         lines.append(f"### #{i} {code} {name}")
         lines.append("")
-        if debate.get("consensus"):
-            lines.append(f"**核心结论**: {debate['consensus']}")
+        # 核心结论:两种来源
+        consensus = debate.get("consensus")
+        if not consensus:
+            # swarm 模式 — 取 final_report 前 200 字作核心结论摘要
+            sw_md = (debate.get("final_report") or "").strip()
+            if sw_md:
+                snippet = sw_md.split("\n\n", 1)[0][:250]
+                consensus = snippet + ("…" if len(sw_md) > 250 else "")
+        if consensus:
+            lines.append(f"**核心结论**: {consensus}")
+        elif debate.get("status") and debate.get("status") != "completed":
+            lines.append(f"**核心结论**: ⚠️ 辩论未完成(`{debate.get('status')}`),后续可手动 `查一下 {debate.get('run_id', '')}` 看进度")
         else:
-            lines.append("**核心结论**: (LLM 辩论未生成)")
+            lines.append("**核心结论**: (未生成辩论)")
         lines.append("")
         lines.append(f"**KHunter 命中策略**: {strats}  ·  最大权重 {it.get('max_kh_weight', 0)}")
         ts = it.get("total_score")
@@ -416,31 +426,53 @@ def build_report_markdown(
             lines.append(f"| 风险惩罚 | {risk:.2f} | — | 涨幅/波动/流动性扣分 |")
             lines.append("")
 
-        # 多空辩论
-        if debate.get("bulls"):
-            lines.append("**多方观点**:")
-            for b in debate["bulls"]:
-                lines.append(f"- {b}")
+        # 辩论部分:两种格式
+        # 1) swarm 模式 (debate.final_report 是完整 markdown)
+        # 2) LLM 模式 (debate.bulls/bears/... 结构化 JSON)
+        swarm_md = (debate.get("final_report") or "").strip()
+        swarm_status = debate.get("status", "")
+        if swarm_md and swarm_status == "completed":
+            lines.append("**多专家辩论报告 (swarm investment_committee)**:")
             lines.append("")
-        if debate.get("bears"):
-            lines.append("**空方观点**:")
-            for b in debate["bears"]:
-                lines.append(f"- {b}")
+            lines.append(f"> run_id: `{debate.get('run_id', '')}` · "
+                          f"elapsed {debate.get('elapsed', 0):.0f}s · "
+                          f"完整投委会(bull/bear/risk/PM)四 agent 协作产出")
             lines.append("")
-        if debate.get("key_disputes"):
-            lines.append("**关键分歧**:")
-            for d in debate["key_disputes"]:
-                lines.append(f"- {d}")
+            # swarm markdown 可能很长,直接贴入(docx max_blocks 已放宽)
+            lines.append(swarm_md)
             lines.append("")
-        if debate.get("guru_takeaways"):
-            lines.append("**游资视角**:")
-            for g in debate["guru_takeaways"]:
-                if isinstance(g, dict):
-                    lines.append(f"- **{g.get('guru', '游资')}**({g.get('school', '')}): {g.get('view', '')}")
+        elif swarm_status and swarm_status != "completed":
+            lines.append(f"**多专家辩论 (swarm)**: ❌ 未完成 — status=`{swarm_status}`,"
+                          f"error: {debate.get('error', '')}")
+            lines.append(f"run_id: `{debate.get('run_id', '')}` · "
+                          f"elapsed {debate.get('elapsed', 0):.0f}s")
             lines.append("")
-        if debate.get("next_day_validation"):
-            lines.append(f"**次日验证**: {debate['next_day_validation']}")
-            lines.append("")
+        else:
+            # LLM 模式(legacy 结构化 JSON)
+            if debate.get("bulls"):
+                lines.append("**多方观点**:")
+                for b in debate["bulls"]:
+                    lines.append(f"- {b}")
+                lines.append("")
+            if debate.get("bears"):
+                lines.append("**空方观点**:")
+                for b in debate["bears"]:
+                    lines.append(f"- {b}")
+                lines.append("")
+            if debate.get("key_disputes"):
+                lines.append("**关键分歧**:")
+                for d in debate["key_disputes"]:
+                    lines.append(f"- {d}")
+                lines.append("")
+            if debate.get("guru_takeaways"):
+                lines.append("**游资视角**:")
+                for g in debate["guru_takeaways"]:
+                    if isinstance(g, dict):
+                        lines.append(f"- **{g.get('guru', '游资')}**({g.get('school', '')}): {g.get('view', '')}")
+                lines.append("")
+            if debate.get("next_day_validation"):
+                lines.append(f"**次日验证**: {debate['next_day_validation']}")
+                lines.append("")
 
         # 简易交易计划(规则生成 — 不靠 LLM 编)
         lines.append("**交易计划**(规则生成,仅供参考):")

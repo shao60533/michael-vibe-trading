@@ -56,8 +56,11 @@ async def run_khunter_pipeline_async(
     max_symbols: int = 300,
     top_n: int = 10,
     enable_debate: bool = True,
+    debate_mode: str = "swarm",
     debate_max_concurrent: int = 4,
+    swarm_timeout_per_run: int = 1800,
     write_files: bool = True,
+    progress_callback=None,
 ) -> dict[str, Any]:
     """完整异步 pipeline:scan + factor + debate(并行) + write files。
 
@@ -103,23 +106,35 @@ async def run_khunter_pipeline_async(
     )
     print(f"[pipeline] step 2 done: {len(factor_scores)} scored", flush=True)
 
-    # 3. Debate (并行,只跑 Top N)
+    # 3. Debate (mode 决定:swarm 真实投委会 / llm 单次调用模拟)
     debates: dict[str, dict[str, Any]] = {}
     if enable_debate:
-        print("[pipeline] step 3: debate (parallel)", flush=True)
         ranks_for_debate = delivery.build_rankings(scan, factor_scores, debates=None)
         top_for_debate = ranks_for_debate.get("top_overall", [])[:top_n]
-        # 把 top 转成 debate 需要的 schema
         cand_for_debate = [
             {"code": it["code"], "name": it["name"],
              "strategies": it["strategies"]}
             for it in top_for_debate
         ]
-        debates = await debate_mod.run_debates_for_top(
-            cand_for_debate, factor_scores,
-            max_concurrent=debate_max_concurrent,
-        )
-        print(f"[pipeline] step 3 done: {len(debates)} debates", flush=True)
+        if debate_mode == "swarm":
+            print(f"[pipeline] step 3: SWARM debate (sequential, "
+                  f"timeout {swarm_timeout_per_run}s/run, top {len(cand_for_debate)})",
+                  flush=True)
+            from . import swarm_debate as swarm_dbt
+            debates = await swarm_dbt.run_swarm_debates_for_top(
+                cand_for_debate,
+                timeout_per_run=swarm_timeout_per_run,
+                progress_callback=progress_callback,
+            )
+        else:
+            print(f"[pipeline] step 3: LLM debate (parallel max_concurrent="
+                  f"{debate_max_concurrent})", flush=True)
+            debates = await debate_mod.run_debates_for_top(
+                cand_for_debate, factor_scores,
+                max_concurrent=debate_max_concurrent,
+            )
+        print(f"[pipeline] step 3 done: {len(debates)} debates "
+              f"(mode={debate_mode})", flush=True)
     else:
         print("[pipeline] step 3 skipped (enable_debate=False)", flush=True)
 
