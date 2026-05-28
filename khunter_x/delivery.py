@@ -253,7 +253,9 @@ def build_report_markdown(
         f"- 股票池: 东财/新浪活跃股,按成交额取前 {params.get('max_symbols', '?')} 只 (实际抓到 {cov.get('fetched_symbols', '?')})",
         f"- 回看窗口: {params.get('days', '?')} 个交易日,K 线历史 {params.get('datalen', '?')} 条",
         "- 11 类技术策略 (KHunter 蒸馏版) — 严格使用真实日线数据,严禁编造",
-        f"- 横截面个股因子: 8 个量价因子 + KHunter 策略权重加成,候选股内做 z-score",
+        "- 横截面个股因子: 9 个量价因子,候选股内做 z-score,加权 + 风险扣分 → 0-10 总分",
+        "  - **已接入**: 20日动量 / 60日动量 / 20日波动率 / 换手代理 / 量价相关 / 资金流代理 / 距MA20 / 当日活跃度 / KH策略权重加成",
+        "  - **口径差异说明**: 现有数据源(Sina K线 + 东财活跃股)**仅覆盖量价/资金面**,**估值(PE/PB)、成长(同比)、质量(ROE)、研报热度** 4 类因子**未接入个股层**,后续可扩(接入腾讯财经 PE/PB + 东财研报 reportapi)。当前评分**纯量价口径**,长线投资视角下信息缺失,适合**短期技术形态 + 流动性**判断。",
         "- 多专家辩论 (LLM 单次调用,7 类专家 + 游资视角)",
         f"- 输出目录: {analysis_date}-khunter-a-share-daily/",
         "",
@@ -354,6 +356,7 @@ def build_report_markdown(
 
     # 单股小节(综合 Top10 每只)
     lines += ["## 个股小节 (综合 Top 10)", ""]
+    # 已接入(K 线衍生)的因子
     factor_names_cn = {
         "momentum_20d": "20 日动量",
         "momentum_60d": "60 日动量",
@@ -364,6 +367,13 @@ def build_report_markdown(
         "ma20_relative": "距 MA20",
         "today_amount_ratio": "当日活跃度",
         "kh_strategy_weight": "KH 策略权重",
+    }
+    # 未接入数据源的因子 — 在 spec 里列出但当前回 NaN,占位透明告知
+    factor_names_cn_unsupported = {
+        "valuation_pe_pb": "估值 (PE/PB)",
+        "growth_yoy": "成长 (营收/利润同比)",
+        "quality_roe": "质量 (ROE)",
+        "research_heat": "研报/公告热度",
     }
     for i, it in enumerate(top, 1):
         code = it.get("code", "")
@@ -390,14 +400,20 @@ def build_report_markdown(
         if raw:
             lines.append("**因子明细**:")
             lines.append("")
-            lines.append("| 因子 | raw | z | 含义 |")
+            lines.append("| 因子 | raw | z | 备注 |")
             lines.append("|---|---|---|---|")
             for f_key, cn in factor_names_cn.items():
                 rv = raw.get(f_key)
                 zv = z.get(f_key)
                 rv_str = f"{rv:.3f}" if isinstance(rv, (int, float)) and rv == rv else "NaN"
                 zv_str = f"{zv:.2f}" if isinstance(zv, (int, float)) and zv == zv else "NaN"
-                lines.append(f"| {cn} | {rv_str} | {zv_str} |")
+                lines.append(f"| {cn} | {rv_str} | {zv_str} | 已接入 |")
+            # 未接入数据源的因子 — 透明告知,不假装支持
+            for f_key, cn in factor_names_cn_unsupported.items():
+                lines.append(f"| {cn} | NaN | NaN | 未接入数据源 |")
+            # 风险惩罚是独立维度
+            risk = it.get("risk_penalty") or 0
+            lines.append(f"| 风险惩罚 | {risk:.2f} | — | 涨幅/波动/流动性扣分 |")
             lines.append("")
 
         # 多空辩论

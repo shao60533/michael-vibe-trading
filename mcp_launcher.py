@@ -2975,8 +2975,10 @@ def _feishu_create_doc_from_report(summary: dict, full_report: str,
 
     blocks.append({"block_type": 22, "divider": {}})
     blocks.append(_feishu_text_block("完整原始报告", "heading2"))
-    blocks.extend(_md_to_feishu_blocks(full_report, max_blocks=60))
-    blocks = blocks[:99]
+    # 之前 max_blocks=60 + blocks[:99] 双重 cap 把 KHunter / 长报告砍光,
+    # 但 _feishu_insert_blocks 已经能 50/批 分块插入,Feishu 单文档支持 ~999 blocks。
+    # 放宽到 800 给 markdown,前置 metadata 自然占余下空间。
+    blocks.extend(_md_to_feishu_blocks(full_report, max_blocks=800))
 
     ok = _feishu_insert_blocks(doc_id, blocks)
     if ok:
