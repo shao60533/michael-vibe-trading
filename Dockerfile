@@ -34,6 +34,7 @@ COPY mcp_launcher.py /app/mcp_launcher.py
 COPY factor_analysis/ /app/factor_analysis/
 COPY sequoia_x/ /app/sequoia_x/
 COPY hot_event_research/ /app/hot_event_research/
+COPY khunter_x/ /app/khunter_x/
 
 # Add-on skills (e.g., a-stock-data). Installed into vibe-trading-ai's bundled
 # skills dir so SkillsLoader picks them up regardless of runtime user / HOME.

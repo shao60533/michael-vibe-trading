@@ -1152,6 +1152,72 @@ def run_hot_event_research(
     return result["report_markdown"]
 
 
+@mcp_server.mcp.tool()
+def run_khunter_daily_pipeline(
+    days: int = 5,
+    max_symbols: int = 300,
+    top_n: int = 10,
+    enable_debate: bool = True,
+    output_format: str = "markdown",
+) -> str:
+    """KHunter A-share daily pipeline: 11-strategy scan + cross-sectional factor
+    scoring + multi-voice debate (LLM,parallel) + outputs/ files.
+
+    Outputs land at `${STATE_DIR}/outputs/<analysis_date>-khunter-a-share-daily/`
+    (or /tmp/outputs/ if STATE_DIR not set):
+      - report.md (full Chinese report with per-stock sections)
+      - candidates.json / candidates.csv (raw per-strategy hits)
+      - rankings.json / rankings.csv (union + factor scores + top10)
+      - generation.log
+      - feishu_status.json (after publish, if applicable)
+
+    Args:
+        days: Recent trading days to evaluate (default 5).
+        max_symbols: Max universe size (default 300 active by amount).
+        top_n: Top N for debate + per-stock detail sections (default 10).
+        enable_debate: Run multi-voice debate per top candidate (parallel).
+        output_format: "markdown" | "json".
+
+    Returns:
+        Markdown report or JSON string with full pipeline result.
+    """
+    try:
+        import asyncio as _asyncio
+        from khunter_x import run_khunter_pipeline_async, KHunterScanError
+        # 同步 entry — 走 async pipeline 但等结果
+        result = _asyncio.run(
+            run_khunter_pipeline_async(
+                days=days, max_symbols=max_symbols, top_n=top_n,
+                enable_debate=enable_debate, write_files=True,
+            )
+        )
+    except KHunterScanError as exc:
+        return json.dumps(
+            {"status": "error", "error_type": "KHunterScanError",
+             "error": str(exc)}, ensure_ascii=False)
+    except ImportError as exc:
+        return json.dumps(
+            {"status": "error", "error_type": "ImportError",
+             "error": f"Missing khunter_x: {exc}"},
+            ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps(
+            {"status": "error", "error_type": type(exc).__name__,
+             "error": str(exc)}, ensure_ascii=False)
+    if output_format.lower() == "json":
+        # 大对象,只取关键
+        return json.dumps({
+            "analysis_date": result.get("scan", {}).get("analysis_date"),
+            "outputs_dir": result.get("outputs_dir"),
+            "files": result.get("files", {}),
+            "elapsed_sec": result.get("elapsed_sec"),
+            "candidates_count": len(result.get("rankings", {}).get("all_ranked", [])),
+            "top_overall": result.get("rankings", {}).get("top_overall", []),
+            "debate_count": len(result.get("debates", {})),
+        }, ensure_ascii=False, default=str)
+    return result["report_markdown"]
+
+
 # ─────────── Feishu integration ───────────
 
 # Tenant token cache (per-process, thread-safe)
@@ -1388,6 +1454,20 @@ _HOT_EVENT_RE = re.compile(
     r"|催化分析[\s::]?|产业链分析[\s::]?",
     re.I,
 )
+
+
+# KHunter 11 策略选股 — 比 sequoia 关键词列表更详细,覆盖每个策略中文名
+_KHUNTER_RE = re.compile(
+    r"khunter|k[-\s]?hunter|k\s*猎人|"
+    r"底部趋势拐点|趋势加速拐点|阻力位?突破|W\s*底|多金叉|启明星|多方炮|"
+    r"涨停回马枪|涨停横盘|弱转强|强势洗盘|仙人指路|"
+    r"K\s*Hunter\s*扫描|K\s*Hunter\s*选股",
+    re.I,
+)
+
+
+def _is_khunter_request(text: str) -> bool:
+    return bool(_KHUNTER_RE.search(text or ""))
 
 
 def _parse_hot_event_request(text: str) -> tuple[bool, str]:
@@ -3513,6 +3593,11 @@ def _build_help_card() -> dict:
          "• `跑下 Sequoia-X 扫描` / `红杉策略选股` — 6 策略 × 活跃 300 只 × 5 天\n"
          "• `海龟突破` / `RPS 突破` / `涨停洗盘` / `高位窄幅旗形` — 任一关键词都识别\n"
          "约 1-3 分钟"),
+        ("🎯 3️⃣d KHunter 日报(完整 pipeline)",
+         "• `KHunter 扫描` / `K-Hunter 选股` — 跑完整日报 pipeline\n"
+         "• `底部趋势拐点` / `仙人指路` / `多金叉` / `涨停回马枪` / `涨停横盘` / `弱转强` / `多方炮` 等 11 策略关键词都触发\n"
+         "流程:11 策略扫描 → 横截面个股因子评分 → Top10 多专家辩论 → outputs/ 多文件 + 卡片/docx/Notion\n"
+         "约 3-6 分钟,硬超时 10 分钟。工作日 08:00 自动推送(需配 `DAILY_KHUNTER_CHAT_ID`)"),
         ("🔬 3️⃣b 热点事件深度分析 (auto-researcher)",
          "• `热点分析:华为韬定律` / `auto-researcher 锂电池价格回升`\n"
          "• `题材拆解 半导体先进封装` / `事件分析:AI 应用变现`\n"
@@ -3708,6 +3793,13 @@ async def _feishu_handle_message(body: dict):
             print(f"[feishu/dispatch] direct sequoia-x scan "
                   f"chat={chat_id} sender={sender_open_id[:12]}..", flush=True)
             await _feishu_handle_sequoia_scan(
+                chat_id, sender_open_id=sender_open_id, chat_type=chat_type)
+            return
+
+        if _is_khunter_request(text):
+            print(f"[feishu/dispatch] direct KHunter pipeline "
+                  f"chat={chat_id} sender={sender_open_id[:12]}..", flush=True)
+            await _feishu_handle_khunter_pipeline(
                 chat_id, sender_open_id=sender_open_id, chat_type=chat_type)
             return
 
@@ -4099,6 +4191,128 @@ async def _feishu_handle_sequoia_scan(chat_id: str,
 # 整体 180s 足够,避免接口抽风拖死。
 HOT_EVENT_HARD_TIMEOUT = int(os.environ.get("HOT_EVENT_TIMEOUT", "180"))
 
+# KHunter pipeline 硬超时(秒)— scan ~1-3min + 因子 ~10s + 辩论 top10 并行 ~2min。
+# 默认 600s 给容错空间;DeepSeek 偶发慢可吃。
+KHUNTER_HARD_TIMEOUT = int(os.environ.get("KHUNTER_HARD_TIMEOUT", "600"))
+
+
+async def _feishu_handle_khunter_pipeline(chat_id: str,
+                                           sender_open_id: str = "",
+                                           chat_type: str = "",
+                                           days: int = 5,
+                                           max_symbols: int = 300,
+                                           top_n: int = 10) -> None:
+    """完整 KHunter daily pipeline + 标准 publish。
+
+    流程:
+      1. ack 飞书
+      2. asyncio.wait_for(KHunter pipeline) — scan + factor + debate + 写 outputs/
+      3. 走 _publish_terminal_run 推卡片 / docx / Notion
+      4. 写 feishu_status.json 记录结果
+
+    feishu_status.json 落在 outputs/{date}-khunter-a-share-daily/ 下。
+    """
+    _feishu_send_text(chat_id, "chat_id",
+        f"🎯 开始 KHunter A 股日报 pipeline\n"
+        f"(11 策略扫描 {max_symbols} 只 × {days} 天 → 个股因子评分 → 多专家辩论 Top{top_n})\n"
+        f"约 3-6 分钟,硬超时 {KHUNTER_HARD_TIMEOUT}s,完成后推回 卡片 + 飞书文档 + Notion。")
+    try:
+        from khunter_x import run_khunter_pipeline_async, KHunterScanError
+        result = await asyncio.wait_for(
+            run_khunter_pipeline_async(
+                days=days, max_symbols=max_symbols, top_n=top_n,
+                enable_debate=True, write_files=True,
+            ),
+            timeout=KHUNTER_HARD_TIMEOUT,
+        )
+    except KHunterScanError as exc:
+        _feishu_send_text(chat_id, "chat_id",
+            f"❌ KHunter pipeline 中止:{exc}")
+        return
+    except asyncio.TimeoutError:
+        _feishu_send_text(chat_id, "chat_id",
+            f"❌ KHunter pipeline 超过 {KHUNTER_HARD_TIMEOUT}s 硬超时 — 稍后再试。")
+        return
+    except ImportError as exc:
+        _feishu_send_text(chat_id, "chat_id",
+            f"❌ khunter_x 模块或依赖缺失:{exc}")
+        return
+    except Exception as exc:
+        print(f"[khunter] unexpected err: {type(exc).__name__}: {exc}",
+              flush=True)
+        _feishu_send_text(chat_id, "chat_id",
+            f"❌ KHunter pipeline 失败:{type(exc).__name__}: {exc}")
+        return
+
+    # publish 走标准管道
+    from types import SimpleNamespace
+    analysis_date = result.get("scan", {}).get("analysis_date") or "unknown"
+    run_id = f"khunter-{analysis_date.replace('-', '')}-{secrets.token_hex(4)}"
+    cov = result.get("scan", {}).get("coverage", {}) or {}
+    rankings = result.get("rankings", {}) or {}
+    top_count = len(rankings.get("top_overall") or [])
+    elapsed = result.get("elapsed_sec", 0)
+    outputs_dir = result.get("outputs_dir") or "(未生成)"
+
+    scope = (f"{cov.get('fetched_symbols', '?')}/{cov.get('requested_symbols', '?')}只 "
+             f"× {len(result.get('scan', {}).get('dates', []))}天 · "
+             f"Top{top_count} · elapsed {elapsed}s")
+
+    # 给卡片+docx 用完整 report.md
+    final_report = result.get("report_markdown") or "(empty)"
+
+    fake_run = SimpleNamespace(
+        id=run_id,
+        status=SimpleNamespace(value="completed"),
+        final_report=final_report,
+        preset_name="sector_rotation_team",
+        user_vars={"target": f"KHunter 日报 {analysis_date}", "market": "CN",
+                   "scope": scope, "outputs_dir": str(outputs_dir)},
+        total_input_tokens=0, total_output_tokens=0, tasks=[],
+    )
+    info = {"receive_id": chat_id, "receive_id_type": "chat_id",
+            "sender_open_id": sender_open_id, "chat_type": chat_type,
+            "target": f"KHunter 日报 {analysis_date}",
+            "preset": "sector_rotation_team",
+            "gurus_override": [], "skip_feishu_card": False}
+
+    publish_status: dict = {
+        "run_id": run_id,
+        "chat_id": chat_id,
+        "analysis_date": analysis_date,
+        "publish_started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "status": "publishing",
+    }
+    try:
+        await _publish_terminal_run(fake_run, info)
+        publish_status["status"] = "ok"
+        publish_status["card_sent"] = True
+    except Exception as exc:
+        publish_status["status"] = "publish_failed"
+        publish_status["error"] = f"{type(exc).__name__}: {exc}"
+        print(f"[khunter] publish err {run_id}: {publish_status['error']}",
+              flush=True)
+        _feishu_send_text(chat_id, "chat_id",
+            f"⚠️ KHunter pipeline 跑完但 publish 失败:"
+            f"{publish_status['error']}\n"
+            f"outputs 仍在: {outputs_dir}\nrun_id: {run_id}")
+    publish_status["publish_finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 写 feishu_status.json
+    if outputs_dir and outputs_dir != "(未生成)":
+        try:
+            from khunter_x import delivery as _delivery
+            _delivery.write_feishu_status(_pathlib_path(outputs_dir), publish_status)
+        except Exception as exc:
+            print(f"[khunter] write feishu_status err: {exc}", flush=True)
+
+
+def _pathlib_path(p):
+    """tiny helper — 局部 import 避免顶部加 pathlib import 污染"""
+    import pathlib as _pl
+    return _pl.Path(p)
+
+
 # ── 每日定时热点推送配置 ──
 # DAILY_HOT_EVENT_CHAT_ID: 推送目标飞书 chat_id (oc_xxx)。空则禁用 scheduler
 # DAILY_HOT_EVENT_HOURS: 逗号分隔小时(默认 "10,15",即北京时间 10:00 + 15:00)
@@ -4287,6 +4501,92 @@ async def _daily_hot_event_scheduler() -> None:
                   f"{type(exc).__name__}: {exc}", flush=True)
         # 多 sleep 几秒避免「同一小时被算成下次最近」二次触发
         await asyncio.sleep(60)
+
+
+# ── 每日工作日盘前 KHunter 推送 ──
+DAILY_KHUNTER_CHAT_ID = os.environ.get("DAILY_KHUNTER_CHAT_ID", "").strip()
+_DAILY_KH_HOURS_RAW = os.environ.get("DAILY_KHUNTER_HOURS", "8").strip()
+try:
+    DAILY_KHUNTER_HOURS = sorted({
+        int(h.strip()) for h in _DAILY_KH_HOURS_RAW.split(",")
+        if h.strip().isdigit() and 0 <= int(h.strip()) <= 23
+    })
+except Exception:
+    DAILY_KHUNTER_HOURS = [8]
+DAILY_KHUNTER_TZ_OFFSET = DAILY_HOT_EVENT_TZ_OFFSET  # 复用 hot_event 的时区
+DAILY_KHUNTER_WEEKDAYS_ONLY = (os.environ.get("DAILY_KHUNTER_WEEKDAYS_ONLY", "true")
+                                .strip().lower() in ("1", "true", "yes", "on"))
+
+
+def _next_weekday_push_dt(hours: list[int], tz_offset: int,
+                          weekdays_only: bool = True):
+    """工作日(周一到周五)next scheduled datetime,带时区。"""
+    import datetime
+    tz = datetime.timezone(datetime.timedelta(hours=tz_offset))
+    now = datetime.datetime.now(tz)
+    # 候选:今天剩余的、明天的、后天的... 最多 7 天内必有一个
+    for day_offset in range(0, 8):
+        dt_base = now + datetime.timedelta(days=day_offset)
+        if weekdays_only and dt_base.weekday() >= 5:  # Sat=5, Sun=6
+            continue
+        for h in hours:
+            candidate = dt_base.replace(hour=h, minute=0, second=0, microsecond=0)
+            if candidate > now:
+                return candidate
+    # fallback (不应该到这里)
+    return now + datetime.timedelta(days=1)
+
+
+async def _do_daily_khunter_push(chat_id: str) -> None:
+    """Run khunter pipeline + publish to chat. 复用现有 handler。"""
+    print(f"[scheduler/khunter] daily push start chat={chat_id}", flush=True)
+    try:
+        await _feishu_handle_khunter_pipeline(
+            chat_id, sender_open_id="", chat_type="",
+            days=5, max_symbols=300, top_n=10,
+        )
+    except Exception as exc:
+        print(f"[scheduler/khunter] handler exception: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+
+
+async def _daily_khunter_scheduler() -> None:
+    """工作日盘前(默认北京 08:00)推送 KHunter 日报。
+
+    DAILY_KHUNTER_CHAT_ID 空 → 静默退出。
+    DAILY_KHUNTER_WEEKDAYS_ONLY=false 时也推周末(默认 true 跳过周末)。
+    """
+    if not DAILY_KHUNTER_CHAT_ID:
+        print("[scheduler/khunter] DAILY_KHUNTER_CHAT_ID 未设,工作日 KHunter 推送禁用",
+              flush=True)
+        return
+    if not DAILY_KHUNTER_HOURS:
+        print("[scheduler/khunter] DAILY_KHUNTER_HOURS 为空,禁用", flush=True)
+        return
+    print(f"[scheduler/khunter] enabled: chat={DAILY_KHUNTER_CHAT_ID} "
+          f"hours={DAILY_KHUNTER_HOURS} (UTC+{DAILY_KHUNTER_TZ_OFFSET}) "
+          f"weekdays_only={DAILY_KHUNTER_WEEKDAYS_ONLY}", flush=True)
+    import datetime
+    while True:
+        next_run = _next_weekday_push_dt(
+            DAILY_KHUNTER_HOURS, DAILY_KHUNTER_TZ_OFFSET,
+            weekdays_only=DAILY_KHUNTER_WEEKDAYS_ONLY,
+        )
+        now = datetime.datetime.now(next_run.tzinfo)
+        wait_sec = max(1.0, (next_run - now).total_seconds())
+        print(f"[scheduler/khunter] next push at {next_run.isoformat()} "
+              f"(wait {wait_sec:.0f}s = {wait_sec/3600:.1f}h)", flush=True)
+        try:
+            await asyncio.sleep(wait_sec)
+        except asyncio.CancelledError:
+            print("[scheduler/khunter] cancelled,exiting", flush=True)
+            return
+        try:
+            await _do_daily_khunter_push(DAILY_KHUNTER_CHAT_ID)
+        except Exception as exc:
+            print(f"[scheduler/khunter] push failed at {next_run.isoformat()}: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+        await asyncio.sleep(120)  # KHunter 跑完已经 ~5min,这里 +2min buffer
 
 
 async def _feishu_handle_cancel_run(chat_id: str, run_id: str) -> None:
@@ -4527,6 +4827,8 @@ async def _lifespan(app):
                 print("[feishu] notion sync: disabled", flush=True)
             # 启动每日热点推送 scheduler (仅当 DAILY_HOT_EVENT_CHAT_ID 已设)
             asyncio.create_task(_daily_hot_event_scheduler())
+            # 启动工作日盘前 KHunter scheduler (仅当 DAILY_KHUNTER_CHAT_ID 已设)
+            asyncio.create_task(_daily_khunter_scheduler())
         else:
             print("[feishu] disabled (LARK_APP_ID/SECRET not set)", flush=True)
         try:

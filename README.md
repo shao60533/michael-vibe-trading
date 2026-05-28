@@ -128,6 +128,17 @@ bot 用 LLM router 解析自然语言指令,**直接说人话即可**。
 
 约 1-3 分钟,硬超时 5 分钟。
 
+### 🎯 KHunter A 股日报(11 策略 + 个股因子 + 多专家辩论)
+
+| 你发 | 行为 |
+|------|------|
+| `KHunter 扫描` / `K-Hunter 选股` | 跑完整 KHunter 日报 pipeline |
+| `底部趋势拐点` / `仙人指路` / `多金叉` / `涨停回马枪` / `涨停横盘` / `弱转强` / `多方炮` / `启明星` / `W底` / `阻力位突破` / `趋势加速拐点` | 任一策略关键词都触发完整 pipeline(11 策略都会扫) |
+
+流程:KHunter 11 策略扫描 → 横截面个股因子评分(9 个量价因子 + KH 权重加成 + 风险扣分)→ Top10 多专家辩论(LLM 7 类专家 + 游资视角,并行)→ 写 `outputs/<日期>-khunter-a-share-daily/`(`report.md` / `candidates.json/csv` / `rankings.json/csv` / `generation.log` / `feishu_status.json`)→ 走标准 publish(卡片 + 飞书 docx + Notion)。约 3-6 分钟,硬超时 10 分钟。
+
+**工作日定时推送**:配置 `DAILY_KHUNTER_CHAT_ID=oc_xxx` 后,**工作日(周一-周五)北京时间 08:00 自动推送**。时间可改 `DAILY_KHUNTER_HOURS=8,12`,周末可改 `DAILY_KHUNTER_WEEKDAYS_ONLY=false`。
+
 ### 🔬 热点事件深度分析 (auto-researcher)
 
 | 你发 | 行为 |

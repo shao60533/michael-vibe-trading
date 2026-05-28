@@ -21,6 +21,24 @@ cut 版本时把 `[Unreleased]` 整体移到一个带日期的版本号下，再
 
 ### Added
 
+- **KHunter A 股日报完整 pipeline**(11 策略 + 横截面个股因子评分 + 多专家辩论 + 多文件交付):
+  - 新 skill `khunter-a-share-selector/`(SKILL.md + scripts/khunter_weekly_scan.py)— 11 种 KHunter 策略蒸馏脚本
+  - 新 Python 包 `khunter_x/`:
+    - `scanner.py` 包装 weekly_scan.py
+    - `stock_factors.py` 横截面个股因子(9 因子:20/60 动量 + 波动率 + 换手代理 + 量价相关 + 资金流代理 + MA20 相对 + 当日活跃 + KH 策略权重)+ 数据质量评级 + 风险惩罚
+    - `debate.py` Top10 多专家辩论(单次 LLM 调用 / 7 类专家 + 游资视角 / 并行,可配 max_concurrent)
+    - `delivery.py` 生成 outputs/<日期>-khunter-a-share-daily/{report.md, candidates.json/csv, rankings.json/csv, generation.log, feishu_status.json}
+    - `service.py` 编排 + sync/async 两种入口
+  - 新 MCP tool `run_khunter_daily_pipeline(days, max_symbols, top_n, enable_debate)` 给 Claude Desktop/Code 用
+  - 飞书自然语言入口:`KHunter` / `K-Hunter` / 任意 11 策略中文名(`底部趋势拐点` / `仙人指路` / `涨停回马枪` 等)触发
+  - 走标准 `_publish_terminal_run` 管道:卡片(精简)+ 飞书 docx(完整 report.md)+ Notion + outputs/ 多文件落 STATE_DIR
+  - **工作日 cron**:`_daily_khunter_scheduler` 进程内 asyncio task,默认北京时间 08:00 推送,跳过周末(`DAILY_KHUNTER_WEEKDAYS_ONLY=true`)
+  - 11 策略 + 权重:涨停横盘/仙人指路(70)、底部趋势拐点/阻力位突破/W底/多金叉共振/涨停回马枪/强势洗盘弱转强(50)、趋势加速拐点/启明星/多方炮(30)
+  - 因子总分映射 0-10 分,base = 5 + z·1.5,再扣风险惩罚(涨幅>50% / 高波动 / 流动性差)
+  - 数据质量等级 A/B/C(< 30 K线 = C 不评分, < 60 = B, 否则 A)
+  - 兜底:scanner 失败 KHunterScanError;debate 失败不影响其他 stock;publish 失败仍保留 outputs/ + 错误写 feishu_status.json
+  - 新 env vars(全部可选):`KHUNTER_HARD_TIMEOUT=600`、`KHUNTER_SCRIPTS_DIR`、`KHUNTER_WORKSPACE`、`DAILY_KHUNTER_CHAT_ID`、`DAILY_KHUNTER_HOURS=8`、`DAILY_KHUNTER_WEEKDAYS_ONLY=true`
+
 - **每日定时热点事件推送**:
   - 新增 `_daily_hot_event_scheduler` 进程内 asyncio 后台任务,启动时 `asyncio.create_task` 拉起
   - 默认北京时间 **10:00 + 15:00** 各推一条:bot 从近期新闻流挑当日最值得做产业链拆解的事件,跑标准 hot_event_research 分析,推送到指定群(卡片 + 飞书 docx + Notion)
