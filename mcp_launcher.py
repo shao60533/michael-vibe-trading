@@ -3799,10 +3799,23 @@ async def _feishu_handle_message(body: dict):
             return
 
         if _is_khunter_request(text):
+            # 解析用户在指令里可选附加的 mode override:
+            #   「KHunter 扫描 llm」/「KHunter 扫描 快速」 → 用 llm 模式跑(~5min)
+            #   「KHunter 扫描 swarm」/「KHunter 扫描 慢」  → 强制 swarm 模式(~2-3h)
+            #   其他 → 用 KHUNTER_DEBATE_MODE env 默认
+            mode_override = None
+            tl = text.lower()
+            if any(k in tl for k in ("llm", "快速", "fast")):
+                mode_override = "llm"
+            elif any(k in text for k in ("swarm", "慢", "深度", "完整投委会")):
+                mode_override = "swarm"
             print(f"[feishu/dispatch] direct KHunter pipeline "
-                  f"chat={chat_id} sender={sender_open_id[:12]}..", flush=True)
+                  f"chat={chat_id} sender={sender_open_id[:12]}.. "
+                  f"mode_override={mode_override}", flush=True)
             await _feishu_handle_khunter_pipeline(
-                chat_id, sender_open_id=sender_open_id, chat_type=chat_type)
+                chat_id, sender_open_id=sender_open_id, chat_type=chat_type,
+                debate_mode_override=mode_override,
+            )
             return
 
         is_hot, event_name = _parse_hot_event_request(text)
@@ -4208,8 +4221,13 @@ async def _feishu_handle_khunter_pipeline(chat_id: str,
                                            chat_type: str = "",
                                            days: int = 5,
                                            max_symbols: int = 300,
-                                           top_n: int = 10) -> None:
+                                           top_n: int = 10,
+                                           debate_mode_override: str | None = None) -> None:
     """完整 KHunter daily pipeline + 标准 publish。
+
+    Args:
+        debate_mode_override: 用户在飞书指令里附加 "llm" 或 "swarm" 可覆盖
+                              env var 默认。None 则用 KHUNTER_DEBATE_MODE。
 
     流程:
       1. ack 飞书 + 跟用户说明本次模式 / 预期耗时
@@ -4218,16 +4236,22 @@ async def _feishu_handle_khunter_pipeline(chat_id: str,
       3. 走 _publish_terminal_run 推卡片 / docx / Notion
       4. 写 feishu_status.json 记录结果
     """
-    if KHUNTER_DEBATE_MODE == "swarm":
+    debate_mode = (debate_mode_override or KHUNTER_DEBATE_MODE).lower()
+    # 模式决定 pipeline 整体超时:llm 模式不需要 4 小时
+    if debate_mode == "llm":
+        pipeline_timeout = min(KHUNTER_HARD_TIMEOUT, 900)  # ≤15min
+    else:
+        pipeline_timeout = KHUNTER_HARD_TIMEOUT
+    if debate_mode == "swarm":
         est = f"约 {top_n} × 10-15 分钟 swarm 串行 + 扫描 5 分钟 ≈ 2-3 小时"
     else:
         est = "约 3-6 分钟"
     _feishu_send_text(chat_id, "chat_id",
         f"🎯 开始 KHunter A 股日报 pipeline\n"
         f"(11 策略扫描 {max_symbols} 只 × {days} 天 → 个股因子评分 → "
-        f"多专家辩论 Top{top_n} [{KHUNTER_DEBATE_MODE} 模式])\n"
-        f"{est},硬超时 {KHUNTER_HARD_TIMEOUT}s,完成后推回 卡片 + 飞书文档 + Notion。"
-        f"\n中途会发进度更新,慢慢跑请稍等。")
+        f"多专家辩论 Top{top_n} [{debate_mode} 模式])\n"
+        f"{est},硬超时 {pipeline_timeout}s,完成后推回 卡片 + 飞书文档 + Notion。"
+        + ("\n中途会发进度更新,慢慢跑请稍等。" if debate_mode == "swarm" else ""))
 
     # 进度回调 — swarm 模式每 2 只发一条
     last_progress: dict = {"sent_at_idx": 0}
@@ -4251,11 +4275,11 @@ async def _feishu_handle_khunter_pipeline(chat_id: str,
             run_khunter_pipeline_async(
                 days=days, max_symbols=max_symbols, top_n=top_n,
                 enable_debate=True, write_files=True,
-                debate_mode=KHUNTER_DEBATE_MODE,
+                debate_mode=debate_mode,
                 swarm_timeout_per_run=KHUNTER_SWARM_TIMEOUT_PER_RUN,
-                progress_callback=_progress_cb,
+                progress_callback=(_progress_cb if debate_mode == "swarm" else None),
             ),
-            timeout=KHUNTER_HARD_TIMEOUT,
+            timeout=pipeline_timeout,
         )
     except KHunterScanError as exc:
         _feishu_send_text(chat_id, "chat_id",
@@ -4263,9 +4287,9 @@ async def _feishu_handle_khunter_pipeline(chat_id: str,
         return
     except asyncio.TimeoutError:
         _feishu_send_text(chat_id, "chat_id",
-            f"❌ KHunter pipeline 超过 {KHUNTER_HARD_TIMEOUT}s 硬超时 — 稍后再试。\n"
-            f"提示:swarm 模式跑 Top10 真投委会需 2-3 小时,如非必要可改 "
-            f"KHUNTER_DEBATE_MODE=llm 提速到 5 分钟。")
+            f"❌ KHunter pipeline 超过 {pipeline_timeout}s 硬超时 — 稍后再试。\n"
+            f"提示:swarm 模式跑 Top10 真投委会需 2-3 小时,llm 模式 ~5 分钟。"
+            f"飞书发『KHunter 扫描 llm』可强制走 llm 模式。")
         return
     except ImportError as exc:
         _feishu_send_text(chat_id, "chat_id",
