@@ -4222,6 +4222,214 @@ KHUNTER_SWARM_TIMEOUT_PER_RUN = int(
     os.environ.get("KHUNTER_SWARM_TIMEOUT_PER_RUN", "1800"))
 
 
+def _build_khunter_picks_card(rankings: dict, analysis_date: str, scope: str,
+                              run_id: str,
+                              feishu_doc_url: str | None = None,
+                              notion_url: str | None = None) -> dict:
+    """KHunter 选股卡 — 个股是主段,LLM 综述废话不要。
+
+    rankings 必须包含 top_overall 列表(每项 code/name/total_score/confidence/
+    strategies_cn/risk_penalty/max_kh_weight/close)。
+    """
+    top10 = rankings.get("top_overall") or []
+    top_risk = rankings.get("top_risk") or []
+    top_low_conf = rankings.get("top_low_confidence") or []
+
+    elements: list[dict] = []
+
+    if top10:
+        lines: list[str] = []
+        for i, it in enumerate(top10, start=1):
+            code = it.get("code") or ""
+            name = it.get("name") or code
+            score = it.get("total_score")
+            score_txt = f"{score:.1f}" if isinstance(score, (int, float)) else "—"
+            conf = it.get("confidence") or "?"
+            strats_cn = it.get("strategies_cn") or []
+            strats_txt = "/".join(strats_cn[:3]) if strats_cn else "—"
+            extra = f" `[{len(strats_cn)}策略]`" if len(strats_cn) > 3 else ""
+            risk = it.get("risk_penalty") or 0
+            risk_tag = f" `风险-{risk:.1f}`" if risk > 0.5 else ""
+            close = it.get("close")
+            close_txt = f"¥{close:.2f}" if isinstance(close, (int, float)) else ""
+            lines.append(
+                f"`{i:>2}.` **{name}** `{code}` · "
+                f"**{score_txt}/10** `[{conf}]` · {strats_txt}{extra}{risk_tag}"
+                + (f" · 收 {close_txt}" if close_txt else "")
+            )
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md",
+                     "content": (f"**🎯 综合 Top {len(top10)} 选股(按综合分降序)**\n"
+                                 + "\n".join(lines))},
+        })
+    else:
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md",
+                     "content": "**🎯 综合 Top 选股**\n_本次没有命中候选股_"},
+        })
+
+    if top_risk:
+        elements.append({"tag": "hr"})
+        risk_lines = []
+        for i, it in enumerate(top_risk[:5], start=1):
+            name = it.get("name") or it.get("code")
+            risk = it.get("risk_penalty") or 0
+            notes = it.get("risk_notes") or []
+            note_txt = (" / ".join(notes[:2]))[:60] if notes else "—"
+            risk_lines.append(
+                f"`{i:>2}.` **{name}** `{it.get('code')}` "
+                f"扣 **-{risk:.1f}** · {note_txt}")
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md",
+                     "content": "**⚠️ 风险榜(高扣分)**\n" + "\n".join(risk_lines)},
+        })
+
+    if top_low_conf:
+        elements.append({"tag": "hr"})
+        lc_lines = []
+        for i, it in enumerate(top_low_conf[:5], start=1):
+            name = it.get("name") or it.get("code")
+            score = it.get("total_score")
+            score_txt = f"{score:.1f}" if isinstance(score, (int, float)) else "—"
+            conf = it.get("confidence") or "?"
+            lc_lines.append(
+                f"`{i:>2}.` **{name}** `{it.get('code')}` · "
+                f"{score_txt}/10 `[{conf}]`")
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md",
+                     "content": ("**📉 低置信度(B/C)— 数据样本不足或质量低**\n"
+                                 + "\n".join(lc_lines))},
+        })
+
+    # 链接按钮
+    actions: list[dict] = []
+    if feishu_doc_url:
+        actions.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "📄 完整投研文档"},
+            "url": feishu_doc_url,
+            "type": "primary",
+        })
+    if notion_url:
+        actions.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "🗂 Notion 备份"},
+            "url": notion_url,
+            "type": "default",
+        })
+    if actions:
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "action", "actions": actions})
+
+    elements.append({
+        "tag": "note",
+        "elements": [{
+            "tag": "plain_text",
+            "content": f"{scope} · run_id: {run_id}",
+        }],
+    })
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text",
+                       "content": f"📊 KHunter A 股日报 · {analysis_date}"},
+            "template": "blue",
+        },
+        "elements": elements,
+    }
+
+
+async def _publish_khunter_picks(rankings: dict, final_report: str,
+                                  analysis_date: str, scope: str,
+                                  run_id: str, info: dict) -> bool:
+    """KHunter 专用 publisher — 跳过 LLM summarizer,选股是主角。
+
+    流程:
+      1. 用最小 summary dict 走 docx 创建(复用 _feishu_create_doc_from_report)
+      2. Notion 同步(复用 _notion_create_page)
+      3. 发 picks 卡片,docx/notion 链接挂底部按钮
+    Returns: True if card sent ok.
+    """
+    chat_id = info["receive_id"]
+    chat_type = info.get("receive_id_type", "chat_id")
+
+    # 最小 summary,供 docx / Notion 用(它们读 title/badge/kv_fields)
+    top_count = len(rankings.get("top_overall") or [])
+    risk_count = len(rankings.get("top_risk") or [])
+    minimal_summary = {
+        "title": f"KHunter A 股日报 {analysis_date}",
+        "badge": f"Top{top_count} 选股",
+        "kv_fields": [
+            {"label": "分析日", "value": analysis_date},
+            {"label": "数据范围", "value": scope},
+            {"label": "综合 Top10",
+             "value": "/".join(
+                 (it.get("name") or it.get("code") or "")
+                 for it in (rankings.get("top_overall") or [])[:10]
+             ) or "—"},
+            {"label": "风险榜数", "value": str(risk_count)},
+        ],
+        "headline": f"KHunter 11 策略综合选股 — {analysis_date}",
+        "short_tldr": "选股结果详见卡片表格,完整辩论 / 因子明细在文档。",
+        "youzi_views": [],
+    }
+
+    # 1. Feishu docx (raw markdown 嵌进去,不走 LLM summary)
+    feishu_doc_url: str | None = None
+    share_with = info.get("sender_open_id") or ""
+    try:
+        feishu_doc_url = await asyncio.to_thread(
+            _feishu_create_doc_from_report, minimal_summary, final_report,
+            run_id, "khunter", share_with,
+        )
+    except Exception as exc:
+        print(f"[khunter/publish] docx err: {type(exc).__name__}: {exc}",
+              flush=True)
+    if feishu_doc_url:
+        print(f"[khunter/publish] docx ok → {feishu_doc_url}", flush=True)
+
+    # 2. Notion
+    notion_url: str | None = None
+    if NOTION_ENABLED:
+        try:
+            notion_url = await _notion_create_page(
+                minimal_summary, final_report, run_id, "khunter")
+        except Exception as exc:
+            print(f"[khunter/publish] notion err: {type(exc).__name__}: {exc}",
+                  flush=True)
+        if notion_url:
+            print(f"[khunter/publish] notion ok → {notion_url}", flush=True)
+
+    # 3. Picks card
+    try:
+        card = _build_khunter_picks_card(
+            rankings, analysis_date, scope, run_id,
+            feishu_doc_url=feishu_doc_url, notion_url=notion_url,
+        )
+        _feishu_send_card(chat_id, chat_type, card)
+        print(f"[khunter/publish] picks card ok", flush=True)
+        return True
+    except Exception as exc:
+        print(f"[khunter/publish] picks card err: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        # 兜底纯文本
+        try:
+            lines = [f"⚠️ KHunter 卡片渲染失败,run_id: {run_id}"]
+            if feishu_doc_url:
+                lines.append(f"📄 飞书文档: {feishu_doc_url}")
+            if notion_url:
+                lines.append(f"🗂 Notion: {notion_url}")
+            _feishu_send_text(chat_id, chat_type, "\n".join(lines))
+        except Exception as exc2:
+            print(f"[khunter/publish] fallback text err: {exc2}", flush=True)
+        return False
+
+
 async def _feishu_handle_khunter_pipeline(chat_id: str,
                                            sender_open_id: str = "",
                                            chat_type: str = "",
@@ -4309,7 +4517,6 @@ async def _feishu_handle_khunter_pipeline(chat_id: str,
         return
 
     # publish 走标准管道
-    from types import SimpleNamespace
     analysis_date = result.get("scan", {}).get("analysis_date") or "unknown"
     run_id = f"khunter-{analysis_date.replace('-', '')}-{secrets.token_hex(4)}"
     cov = result.get("scan", {}).get("coverage", {}) or {}
@@ -4322,23 +4529,10 @@ async def _feishu_handle_khunter_pipeline(chat_id: str,
              f"× {len(result.get('scan', {}).get('dates', []))}天 · "
              f"Top{top_count} · elapsed {elapsed}s")
 
-    # 给卡片+docx 用完整 report.md
     final_report = result.get("report_markdown") or "(empty)"
 
-    fake_run = SimpleNamespace(
-        id=run_id,
-        status=SimpleNamespace(value="completed"),
-        final_report=final_report,
-        preset_name="sector_rotation_team",
-        user_vars={"target": f"KHunter 日报 {analysis_date}", "market": "CN",
-                   "scope": scope, "outputs_dir": str(outputs_dir)},
-        total_input_tokens=0, total_output_tokens=0, tasks=[],
-    )
     info = {"receive_id": chat_id, "receive_id_type": "chat_id",
-            "sender_open_id": sender_open_id, "chat_type": chat_type,
-            "target": f"KHunter 日报 {analysis_date}",
-            "preset": "sector_rotation_team",
-            "gurus_override": [], "skip_feishu_card": False}
+            "sender_open_id": sender_open_id, "chat_type": chat_type}
 
     publish_status: dict = {
         "run_id": run_id,
@@ -4348,9 +4542,11 @@ async def _feishu_handle_khunter_pipeline(chat_id: str,
         "status": "publishing",
     }
     try:
-        await _publish_terminal_run(fake_run, info)
-        publish_status["status"] = "ok"
-        publish_status["card_sent"] = True
+        # KHunter 专用 publish — 跳过 LLM summarizer,picks 卡是主角
+        ok = await _publish_khunter_picks(
+            rankings, final_report, analysis_date, scope, run_id, info)
+        publish_status["status"] = "ok" if ok else "publish_partial"
+        publish_status["card_sent"] = ok
     except Exception as exc:
         publish_status["status"] = "publish_failed"
         publish_status["error"] = f"{type(exc).__name__}: {exc}"
@@ -4717,15 +4913,15 @@ async def _feishu_handle_intraday_request(chat_id: str,
     print(f"[intraday] start chat={chat_id} label={label}", flush=True)
     try:
         snap = await asyncio.wait_for(
-            intraday_svc.build_snapshot(top_boards=10, top_limit_up=5,
-                                         with_briefing=True),
-            timeout=60,
+            intraday_svc.build_snapshot(top_boards=10, top_picks=10),
+            timeout=30,
         )
         card = intraday_svc.render_feishu_card(snap, title_prefix=f"🔥 {label}")
         _feishu_send_card(chat_id, chat_type, card)
         print(f"[intraday] done elapsed={snap['elapsed_sec']}s "
+              f"picks={len(snap['picks'])} "
               f"boards={len(snap['boards_concept'])} "
-              f"zt={snap['limit_up_total']} briefings={len(snap['briefings'])}",
+              f"zt={snap['limit_up_total']}",
               flush=True)
     except Exception as exc:
         print(f"[intraday] failed: {type(exc).__name__}: {exc}", flush=True)
