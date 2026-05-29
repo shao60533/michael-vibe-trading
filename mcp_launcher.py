@@ -3798,6 +3798,12 @@ async def _feishu_handle_message(body: dict):
                 chat_id, sender_open_id=sender_open_id, chat_type=chat_type)
             return
 
+        if _is_intraday_request(text):
+            print(f"[feishu/dispatch] intraday snapshot "
+                  f"chat={chat_id} sender={sender_open_id[:12]}..", flush=True)
+            await _feishu_handle_intraday_request(chat_id, chat_type=chat_type)
+            return
+
         if _is_khunter_request(text):
             # 解析用户在指令里可选附加的 mode override:
             #   「KHunter 扫描 llm」/「KHunter 扫描 快速」 → 用 llm 模式跑(~5min)
@@ -4647,6 +4653,133 @@ async def _daily_khunter_scheduler() -> None:
         await asyncio.sleep(120)  # KHunter 跑完已经 ~5min,这里 +2min buffer
 
 
+# ── 盘中异动推送 (intraday) ──
+# 3 时点定时 + 用户主动触发 + KHunter Top20 个股因子分串联
+
+INTRADAY_CHAT_ID = os.environ.get("INTRADAY_CHAT_ID", "").strip()
+_INTRADAY_TIMES_RAW = os.environ.get("INTRADAY_TIMES", "09:55,11:25,14:55").strip()
+
+
+def _parse_hhmm_list(raw: str) -> list[tuple[int, int]]:
+    """解析 "09:55,11:25,14:55" → [(9,55), (11,25), (14,55)],排序去重。"""
+    out: set[tuple[int, int]] = set()
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if ":" not in tok:
+            continue
+        hh, mm = tok.split(":", 1)
+        try:
+            h, m = int(hh), int(mm)
+        except ValueError:
+            continue
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            out.add((h, m))
+    return sorted(out)
+
+
+INTRADAY_TIMES = _parse_hhmm_list(_INTRADAY_TIMES_RAW)
+INTRADAY_WEEKDAYS_ONLY = (os.environ.get("INTRADAY_WEEKDAYS_ONLY", "true")
+                          .strip().lower() in ("1", "true", "yes", "on"))
+
+
+_INTRADAY_RE = re.compile(
+    r"盘[口中]异动|板块异动|今[日天]异动|盘中板块|盘口快报|intraday",
+    re.I,
+)
+
+
+def _is_intraday_request(text: str) -> bool:
+    return bool(_INTRADAY_RE.search(text or ""))
+
+
+def _next_weekday_hhmm_dt(times: list[tuple[int, int]], tz_offset: int,
+                          weekdays_only: bool = True):
+    """工作日 next scheduled datetime,支持 HH:MM 精度。"""
+    import datetime
+    tz = datetime.timezone(datetime.timedelta(hours=tz_offset))
+    now = datetime.datetime.now(tz)
+    for day_offset in range(0, 8):
+        dt_base = now + datetime.timedelta(days=day_offset)
+        if weekdays_only and dt_base.weekday() >= 5:
+            continue
+        for h, m in times:
+            candidate = dt_base.replace(hour=h, minute=m, second=0, microsecond=0)
+            if candidate > now:
+                return candidate
+    return now + datetime.timedelta(days=1)
+
+
+async def _feishu_handle_intraday_request(chat_id: str,
+                                           chat_type: str = "chat_id",
+                                           label: str = "盘中异动") -> None:
+    """抓盘中快照 → LLM 简评 → 推飞书卡片。用户主动 + scheduler 共用。"""
+    from intraday import service as intraday_svc
+    print(f"[intraday] start chat={chat_id} label={label}", flush=True)
+    try:
+        snap = await asyncio.wait_for(
+            intraday_svc.build_snapshot(top_boards=10, top_limit_up=5,
+                                         with_briefing=True),
+            timeout=60,
+        )
+        card = intraday_svc.render_feishu_card(snap, title_prefix=f"🔥 {label}")
+        _feishu_send_card(chat_id, chat_type, card)
+        print(f"[intraday] done elapsed={snap['elapsed_sec']}s "
+              f"boards={len(snap['boards_concept'])} "
+              f"zt={snap['limit_up_total']} briefings={len(snap['briefings'])}",
+              flush=True)
+    except Exception as exc:
+        print(f"[intraday] failed: {type(exc).__name__}: {exc}", flush=True)
+        try:
+            from intraday import service as intraday_svc
+            err_card = intraday_svc.render_error_card(
+                f"{type(exc).__name__}: {exc}", title_prefix=f"🔥 {label}")
+            _feishu_send_card(chat_id, chat_type, err_card)
+        except Exception as exc2:
+            print(f"[intraday] err-card send failed: {exc2}", flush=True)
+
+
+async def _intraday_scheduler() -> None:
+    """工作日 3 时点(默认 09:55/11:25/14:55)盘中异动定时推送。
+
+    INTRADAY_CHAT_ID 空 → 静默退出。
+    """
+    if not INTRADAY_CHAT_ID:
+        print("[scheduler/intraday] INTRADAY_CHAT_ID 未设,盘中异动推送禁用",
+              flush=True)
+        return
+    if not INTRADAY_TIMES:
+        print("[scheduler/intraday] INTRADAY_TIMES 为空,禁用", flush=True)
+        return
+    times_str = ",".join(f"{h:02d}:{m:02d}" for h, m in INTRADAY_TIMES)
+    print(f"[scheduler/intraday] enabled: chat={INTRADAY_CHAT_ID} "
+          f"times={times_str} (UTC+{DAILY_KHUNTER_TZ_OFFSET}) "
+          f"weekdays_only={INTRADAY_WEEKDAYS_ONLY}", flush=True)
+    import datetime
+    while True:
+        next_run = _next_weekday_hhmm_dt(
+            INTRADAY_TIMES, DAILY_KHUNTER_TZ_OFFSET,
+            weekdays_only=INTRADAY_WEEKDAYS_ONLY,
+        )
+        now = datetime.datetime.now(next_run.tzinfo)
+        wait_sec = max(1.0, (next_run - now).total_seconds())
+        print(f"[scheduler/intraday] next push at {next_run.isoformat()} "
+              f"(wait {wait_sec:.0f}s = {wait_sec/60:.1f}min)", flush=True)
+        try:
+            await asyncio.sleep(wait_sec)
+        except asyncio.CancelledError:
+            print("[scheduler/intraday] cancelled", flush=True)
+            return
+        label = f"盘中异动 {next_run.strftime('%H:%M')}"
+        try:
+            await _feishu_handle_intraday_request(
+                INTRADAY_CHAT_ID, chat_type="chat_id", label=label)
+        except Exception as exc:
+            print(f"[scheduler/intraday] push failed: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+        # 至少跳过当前分钟,避免在同一窗口里被算成下次最近
+        await asyncio.sleep(70)
+
+
 async def _feishu_handle_cancel_run(chat_id: str, run_id: str) -> None:
     """Kill a stuck/unwanted run. Mirrors /_debug/purge-run logic."""
     import ctypes, pathlib, shutil
@@ -4887,6 +5020,8 @@ async def _lifespan(app):
             asyncio.create_task(_daily_hot_event_scheduler())
             # 启动工作日盘前 KHunter scheduler (仅当 DAILY_KHUNTER_CHAT_ID 已设)
             asyncio.create_task(_daily_khunter_scheduler())
+            # 启动盘中异动 3 时点推送 (仅当 INTRADAY_CHAT_ID 已设)
+            asyncio.create_task(_intraday_scheduler())
         else:
             print("[feishu] disabled (LARK_APP_ID/SECRET not set)", flush=True)
         try:
