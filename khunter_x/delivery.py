@@ -263,51 +263,112 @@ def build_report_markdown(
     names_cn = scan_result.get("strategy_names_cn") or {}
     top = rankings.get("top_overall") or []
 
+    from .visuals import (score_bar, heat_emoji, confidence_emoji,
+                          risk_badge, histogram)
+
     lines: list[str] = []
 
     # ── 标题 + 一行 metadata ──
     lines += [
         f"# KHunter A 股日报 — {analysis_date}",
         "",
-        (f"> 股池 {cov.get('fetched_symbols', '?')}/{cov.get('requested_symbols', '?')} 只 · "
-         f"回看 {params.get('days', '?')} 天 · "
-         f"耗时 {cov.get('elapsed_seconds', '?')}s · "
-         f"综合 Top{len(top)}"),
+        (f"> 📦 股池 {cov.get('fetched_symbols', '?')}/{cov.get('requested_symbols', '?')} 只 · "
+         f"⏱ 回看 {params.get('days', '?')} 天 · "
+         f"⌛ 耗时 {cov.get('elapsed_seconds', '?')}s · "
+         f"🥇 综合 Top{len(top)}"),
         "",
     ]
+
+    # ── 仪表盘:核心指标 ──
+    if top:
+        valid_scores = [it.get("total_score") for it in top
+                         if isinstance(it.get("total_score"), (int, float))
+                         and it.get("total_score") == it.get("total_score")]
+        avg_score = sum(valid_scores) / len(valid_scores) if valid_scores else None
+        max_score = max(valid_scores) if valid_scores else None
+        n_a = sum(1 for it in top if (it.get("confidence") or "").upper() == "A")
+        n_b = sum(1 for it in top if (it.get("confidence") or "").upper() == "B")
+        n_c = sum(1 for it in top if (it.get("confidence") or "").upper() == "C")
+        n_risk = sum(1 for it in top if (it.get("risk_penalty") or 0) > 0.5)
+        lines += [
+            "## 📊 今日盘面仪表盘",
+            "",
+            "| 指标 | 值 | 可视化 |",
+            "|---|---|---|",
+            (f"| Top{len(top)} 平均综合分 | **{avg_score:.2f}/10** | "
+             f"{score_bar(avg_score, with_text=False)} |"
+             if avg_score is not None
+             else f"| Top{len(top)} 平均综合分 | — | — |"),
+            (f"| 最高综合分 | **{max_score:.2f}/10** {heat_emoji(max_score)} | "
+             f"{score_bar(max_score, with_text=False)} |"
+             if max_score is not None
+             else f"| 最高综合分 | — | — |"),
+            f"| 置信度分布 (A/B/C) | **{n_a} / {n_b} / {n_c}** | "
+            f"✅×{n_a}  ⚠️×{n_b}  ❌×{n_c} |",
+            f"| 带风险扣分的股 | **{n_risk}** | "
+            f"{'⚠️' * min(n_risk, 5)}{'…' if n_risk > 5 else ''} |",
+            "",
+        ]
 
     # ── 选股一览 (Top10 一行带过,让读者第一眼看到名单) ──
     if top:
         names_line = "  ·  ".join(
-            f"#{i+1} **{it.get('name', '')}** `{it.get('code', '')}` "
-            f"({it.get('total_score', 0):.1f}/10)"
-            if isinstance(it.get("total_score"), (int, float)) and it.get("total_score") == it.get("total_score")
-            else f"#{i+1} **{it.get('name', '')}** `{it.get('code', '')}` (—)"
+            f"#{i+1} {heat_emoji(it.get('total_score'))} **{it.get('name', '')}** "
+            f"`{it.get('code', '')}` "
+            + (f"({it.get('total_score'):.1f})"
+               if isinstance(it.get("total_score"), (int, float))
+               and it.get("total_score") == it.get("total_score")
+               else "(—)")
             for i, it in enumerate(top[:10])
         )
         lines += ["## 🎯 今日选股一览", "", names_line, ""]
 
-    # ── 综合 Top10 详细表 ──
+    # ── 综合 Top10 详细表 (带 score bar + heat emoji) ──
     lines += ["## 🥇 综合 Top10 详细表", ""]
     if top:
-        lines.append("| # | 代码 | 名称 | 综合分 | 置信 | 命中策略 | KH权重 | 风险扣分 | 收盘 |")
-        lines.append("|---|---|---|---|---|---|---|---|---|")
+        lines.append(
+            "| # | 代码 | 名称 | 综合分 (bar) | 热度 | 置信 | 命中策略 | "
+            "KH权重 | 风险 | 收盘 |"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|---|---|")
         for i, it in enumerate(top, 1):
             strats = " / ".join((it.get("strategies_cn") or [])[:3])
             ts = it.get("total_score")
-            ts_str = f"{ts:.2f}" if isinstance(ts, (int, float)) and ts == ts else "—"
             close = it.get("close")
             close_str = f"{close:.2f}" if isinstance(close, (int, float)) else "—"
             risk = it.get("risk_penalty") or 0
-            risk_str = f"-{risk:.1f}" if risk > 0 else "—"
             lines.append(
-                f"| {i} | {it.get('code', '')} | {it.get('name', '')} | "
-                f"**{ts_str}** | {it.get('confidence', '?')} | {strats} | "
-                f"{it.get('max_kh_weight', 0)} | {risk_str} | {close_str} |"
+                f"| {i} | {it.get('code', '')} | **{it.get('name', '')}** | "
+                f"{score_bar(ts, with_text=True)} | {heat_emoji(ts)} | "
+                f"{confidence_emoji(it.get('confidence'))} | {strats} | "
+                f"{it.get('max_kh_weight', 0)} | "
+                f"{risk_badge(risk) if risk > 0.5 else '—'} | {close_str} |"
             )
     else:
         lines.append("(无候选)")
     lines.append("")
+
+    # ── KHunter 11 策略命中分布(直方图) ──
+    daily = scan_result.get("daily_results") or []
+    if daily:
+        last_day = daily[-1]
+        strats_dict = last_day.get("strategies") or {}
+        hist_buckets: list[tuple[str, int]] = []
+        for strategy_name, info in sorted(
+            strats_dict.items(),
+            key=lambda kv: (info := kv[1]).get("count", 0),  # noqa
+            reverse=True,
+        ):
+            cn = names_cn.get(strategy_name, strategy_name)
+            n = info.get("count", 0)
+            hist_buckets.append((cn, n))
+        # 去掉 0 命中,直方图只展示命中过的策略
+        hist_buckets = [b for b in hist_buckets if b[1] > 0]
+        if hist_buckets:
+            lines += ["## 📊 11 策略命中分布", ""]
+            for ln in histogram(hist_buckets, max_bar_width=30):
+                lines.append(ln)
+            lines.append("")
 
     # ── 风险榜 ──
     risks = rankings.get("top_risk") or []
@@ -363,24 +424,29 @@ def build_report_markdown(
         strats = ", ".join(it.get("strategies_cn") or [])
         debate = debates.get(code) or {}
 
-        lines.append(f"### #{i} {name} {code}")
+        lines.append(f"### #{i} {heat_emoji(it.get('total_score'))} {name} {code}")
         lines.append("")
 
-        # 1) 一行关键指标 (选股决策最关心的)
+        # 1) 评分卡(table 替代 prose 一行)
         ts = it.get("total_score")
-        ts_str = f"{ts:.2f}" if isinstance(ts, (int, float)) and ts == ts else "—"
         risk = it.get("risk_penalty") or 0
         close = it.get("close")
-        close_str = f"{close:.2f}" if isinstance(close, (int, float)) else "—"
-        lines.append(
-            f"**综合分 {ts_str}/10**  ·  置信度 {it.get('confidence', '?')}  ·  "
-            f"风险扣分 {risk:.2f}  ·  收盘 {close_str}  ·  "
-            f"命中 {len(it.get('strategies_cn') or [])} 类 KH 策略 "
-            f"(最大权重 {it.get('max_kh_weight', 0)})"
-        )
-        lines.append("")
-        lines.append(f"**KHunter 命中策略**: {strats or '(无)'}")
-        lines.append("")
+        close_str = f"¥{close:.2f}" if isinstance(close, (int, float)) else "—"
+        n_strats = len(it.get("strategies_cn") or [])
+        lines += [
+            "| 评分卡 | 值 |",
+            "|---|---|",
+            f"| 综合分 | {score_bar(ts)} {heat_emoji(ts)} |",
+            f"| 置信度 | {confidence_emoji(it.get('confidence'))} {it.get('confidence', '?')} |",
+            (f"| 风险扣分 | {risk_badge(risk)}  -{risk:.2f} |"
+             if risk > 0.5
+             else "| 风险扣分 | — |"),
+            f"| 命中 KH 策略 | **{n_strats} 类**(最大权重 {it.get('max_kh_weight', 0)}) |",
+            f"| 收盘价 | {close_str} |",
+            "",
+            f"**命中策略**: {strats or '(无)'}",
+            "",
+        ]
 
         # 2) 核心结论 (辩论压缩)
         consensus = debate.get("consensus")

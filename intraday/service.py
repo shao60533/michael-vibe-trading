@@ -153,8 +153,10 @@ def _board_brief_line(b: eastmoney.BoardSnapshot) -> str:
 
 
 def render_feishu_card(snap: dict[str, Any],
-                       title_prefix: str = "🔥 盘中异动") -> dict:
-    """构造飞书 interactive card — 选股表是主段。"""
+                       title_prefix: str = "🔥 盘中异动",
+                       feishu_doc_url: str | None = None,
+                       notion_url: str | None = None) -> dict:
+    """构造飞书 interactive card — 选股表是主段,可选挂 docx/notion 按钮。"""
     ts: datetime.datetime = snap["ts_bj"]
     picks: list[Pick] = snap["picks"]
     boards: list[eastmoney.BoardSnapshot] = snap["boards_concept"]
@@ -191,6 +193,26 @@ def render_feishu_card(snap: dict[str, Any],
             "text": {"tag": "lark_md",
                       "content": "**📊 异动板块速览**\n" + "\n".join(brief_lines)},
         })
+
+    # 链接按钮
+    actions: list[dict] = []
+    if feishu_doc_url:
+        actions.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "📄 完整盘面文档"},
+            "url": feishu_doc_url,
+            "type": "primary",
+        })
+    if notion_url:
+        actions.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "🗂 Notion 备份"},
+            "url": notion_url,
+            "type": "default",
+        })
+    if actions:
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "action", "actions": actions})
 
     # 底部 note
     elements.append({"tag": "hr"})

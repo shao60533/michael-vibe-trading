@@ -3801,7 +3801,10 @@ async def _feishu_handle_message(body: dict):
         if _is_intraday_request(text):
             print(f"[feishu/dispatch] intraday snapshot "
                   f"chat={chat_id} sender={sender_open_id[:12]}..", flush=True)
-            await _feishu_handle_intraday_request(chat_id, chat_type=chat_type)
+            await _feishu_handle_intraday_request(
+                chat_id, chat_type=chat_type,
+                sender_open_id=sender_open_id,
+            )
             return
 
         if _is_khunter_request(text):
@@ -4907,31 +4910,109 @@ def _next_weekday_hhmm_dt(times: list[tuple[int, int]], tz_offset: int,
 
 async def _feishu_handle_intraday_request(chat_id: str,
                                            chat_type: str = "chat_id",
-                                           label: str = "盘中异动") -> None:
-    """抓盘中快照 → LLM 简评 → 推飞书卡片。用户主动 + scheduler 共用。"""
+                                           label: str = "盘中异动",
+                                           sender_open_id: str = "") -> None:
+    """抓盘中快照 → 生成 docx(+Notion)→ 推卡片(挂 docx 按钮)。
+
+    卡片是 actionable 主线;docx 是更深盘面分析(全涨停榜 + 板块榜 +
+    KH 串联 + 分布图)。
+    """
     from intraday import service as intraday_svc
+    from intraday import delivery as intraday_delivery
     print(f"[intraday] start chat={chat_id} label={label}", flush=True)
     try:
         snap = await asyncio.wait_for(
-            intraday_svc.build_snapshot(top_boards=10, top_picks=10),
+            intraday_svc.build_snapshot(top_boards=20, top_picks=10),
             timeout=30,
         )
-        card = intraday_svc.render_feishu_card(snap, title_prefix=f"🔥 {label}")
-        _feishu_send_card(chat_id, chat_type, card)
-        print(f"[intraday] done elapsed={snap['elapsed_sec']}s "
-              f"picks={len(snap['picks'])} "
-              f"boards={len(snap['boards_concept'])} "
-              f"zt={snap['limit_up_total']}",
-              flush=True)
     except Exception as exc:
-        print(f"[intraday] failed: {type(exc).__name__}: {exc}", flush=True)
+        print(f"[intraday] snapshot failed: {type(exc).__name__}: {exc}",
+              flush=True)
         try:
-            from intraday import service as intraday_svc
             err_card = intraday_svc.render_error_card(
                 f"{type(exc).__name__}: {exc}", title_prefix=f"🔥 {label}")
             _feishu_send_card(chat_id, chat_type, err_card)
         except Exception as exc2:
             print(f"[intraday] err-card send failed: {exc2}", flush=True)
+        return
+
+    # Build docx markdown
+    try:
+        report_md = intraday_delivery.build_intraday_report_markdown(
+            snap, label=label)
+    except Exception as exc:
+        print(f"[intraday] build_md err: {type(exc).__name__}: {exc}",
+              flush=True)
+        report_md = f"# {label}\n\n_报告 markdown 生成失败: {exc}_"
+
+    # 创建 docx + Notion(独立 best-effort)
+    ts = snap["ts_bj"]
+    run_id = f"intraday-{ts.strftime('%Y%m%d-%H%M%S')}"
+    minimal_summary = {
+        "title": f"{label} {ts.strftime('%Y-%m-%d %H:%M')}",
+        "badge": "盘中异动",
+        "kv_fields": [
+            {"label": "时点", "value": ts.strftime("%Y-%m-%d %H:%M 北京")},
+            {"label": "涨停总数", "value": str(snap["limit_up_total"])},
+            {"label": "异动板块数",
+             "value": str(len(snap["boards_concept"]))},
+            {"label": "异动选股数", "value": str(len(snap["picks"]))},
+        ],
+        "headline": f"{label} · {ts.strftime('%H:%M')}",
+        "short_tldr": "完整盘面快照(全涨停 + 异动板块 + KH 串联)详见文档。",
+        "youzi_views": [],
+    }
+
+    feishu_doc_url: str | None = None
+    try:
+        feishu_doc_url = await asyncio.to_thread(
+            _feishu_create_doc_from_report, minimal_summary, report_md,
+            run_id, "intraday", sender_open_id,
+        )
+    except Exception as exc:
+        print(f"[intraday] docx err: {type(exc).__name__}: {exc}",
+              flush=True)
+    if feishu_doc_url:
+        print(f"[intraday] docx ok → {feishu_doc_url}", flush=True)
+
+    notion_url: str | None = None
+    if NOTION_ENABLED:
+        try:
+            notion_url = await _notion_create_page(
+                minimal_summary, report_md, run_id, "intraday")
+        except Exception as exc:
+            print(f"[intraday] notion err: {type(exc).__name__}: {exc}",
+                  flush=True)
+        if notion_url:
+            print(f"[intraday] notion ok → {notion_url}", flush=True)
+
+    # 推卡片(挂 docx / notion 按钮)
+    try:
+        card = intraday_svc.render_feishu_card(
+            snap, title_prefix=f"🔥 {label}",
+            feishu_doc_url=feishu_doc_url, notion_url=notion_url,
+        )
+        _feishu_send_card(chat_id, chat_type, card)
+        print(f"[intraday] done elapsed={snap['elapsed_sec']}s "
+              f"picks={len(snap['picks'])} "
+              f"boards={len(snap['boards_concept'])} "
+              f"zt={snap['limit_up_total']} "
+              f"doc={'ok' if feishu_doc_url else 'no'} "
+              f"notion={'ok' if notion_url else 'no'}",
+              flush=True)
+    except Exception as exc:
+        print(f"[intraday] card render err: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        # 兜底:链接发文本
+        try:
+            lines = [f"⚠️ 盘中异动 {label} 卡片渲染失败"]
+            if feishu_doc_url:
+                lines.append(f"📄 文档: {feishu_doc_url}")
+            if notion_url:
+                lines.append(f"🗂 Notion: {notion_url}")
+            _feishu_send_text(chat_id, chat_type, "\n".join(lines))
+        except Exception as exc2:
+            print(f"[intraday] fallback text err: {exc2}", flush=True)
 
 
 async def _intraday_scheduler() -> None:
