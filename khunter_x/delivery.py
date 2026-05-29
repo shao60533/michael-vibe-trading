@@ -231,119 +231,102 @@ def _format_factor_row(name: str, raw: float, z: float) -> str:
     return f"| {name} | {raw_str} | {z_str} |"
 
 
+def _demote_markdown_headings(md: str) -> str:
+    """把嵌入文本里的 #/##/### 类标题降级为 bold 段落,
+    避免 swarm 投委会的内置 ## 标题污染外层 docx 目录层级。"""
+    import re as _re
+    out: list[str] = []
+    for ln in md.split("\n"):
+        m = _re.match(r"^\s*(#{1,6})\s+(.+?)\s*$", ln)
+        if m:
+            out.append(f"**{m.group(2).strip()}**")
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+
 def build_report_markdown(
     scan_result: dict[str, Any],
     rankings: dict[str, Any],
     debates: dict[str, dict[str, Any]] | None = None,
 ) -> str:
-    """完整 markdown 报告。"""
+    """完整 markdown 报告 — 选股优先布局。
+
+    顺序: 一览 → 综合 Top10 → 风险榜 → 低置信榜 → 个股深度 →
+          11 类策略命中明细(支撑)→ 方法说明 & 数据(注脚)。
+    """
     debates = debates or {}
     analysis_date = scan_result.get("analysis_date") or "?"
     cov = scan_result.get("coverage", {}) or {}
     params = scan_result.get("parameters", {}) or {}
     weights = scan_result.get("strategy_weights") or {}
     names_cn = scan_result.get("strategy_names_cn") or {}
+    top = rankings.get("top_overall") or []
 
     lines: list[str] = []
+
+    # ── 标题 + 一行 metadata ──
     lines += [
         f"# KHunter A 股日报 — {analysis_date}",
         "",
-        "## 方法说明",
-        "- 数据源: " + (scan_result.get("data_source") or "?"),
-        f"- 股票池: 东财/新浪活跃股,按成交额取前 {params.get('max_symbols', '?')} 只 (实际抓到 {cov.get('fetched_symbols', '?')})",
-        f"- 回看窗口: {params.get('days', '?')} 个交易日,K 线历史 {params.get('datalen', '?')} 条",
-        "- 11 类技术策略 (KHunter 蒸馏版) — 严格使用真实日线数据,严禁编造",
-        "- 横截面个股因子: 9 个量价因子,候选股内做 z-score,加权 + 风险扣分 → 0-10 总分",
-        "  - **已接入**: 20日动量 / 60日动量 / 20日波动率 / 换手代理 / 量价相关 / 资金流代理 / 距MA20 / 当日活跃度 / KH策略权重加成",
-        "  - **口径差异说明**: 现有数据源(Sina K线 + 东财活跃股)**仅覆盖量价/资金面**,**估值(PE/PB)、成长(同比)、质量(ROE)、研报热度** 4 类因子**未接入个股层**,后续可扩(接入腾讯财经 PE/PB + 东财研报 reportapi)。当前评分**纯量价口径**,长线投资视角下信息缺失,适合**短期技术形态 + 流动性**判断。",
-        "- 多专家辩论 (LLM 单次调用,7 类专家 + 游资视角)",
-        f"- 输出目录: {analysis_date}-khunter-a-share-daily/",
-        "",
-        "## 数据覆盖",
-        f"- 请求股池规模: {cov.get('requested_symbols', '?')} 只",
-        f"- 成功拉取 K 线: {cov.get('fetched_symbols', '?')} 只",
-        f"- 失败 / 数据不足: {cov.get('error_symbols', '?')} 只",
-        f"- 耗时: {cov.get('elapsed_seconds', '?')} 秒",
+        (f"> 股池 {cov.get('fetched_symbols', '?')}/{cov.get('requested_symbols', '?')} 只 · "
+         f"回看 {params.get('days', '?')} 天 · "
+         f"耗时 {cov.get('elapsed_seconds', '?')}s · "
+         f"综合 Top{len(top)}"),
         "",
     ]
 
-    # 11 类策略
-    lines += ["## 11 类策略候选 (按策略权重 + 命中数排序)", ""]
-    daily = scan_result.get("daily_results") or []
-    if daily:
-        last_day = daily[-1]
-        strats = last_day.get("strategies") or {}
-        # 按权重降序展示
-        ordered = sorted(strats.items(),
-                          key=lambda kv: (weights.get(kv[0], 0), kv[1].get("count", 0)),
-                          reverse=True)
-        for strategy_name, info in ordered:
-            cn = names_cn.get(strategy_name, strategy_name)
-            w = weights.get(strategy_name, 0)
-            hits = info.get("top") or []
-            count = info.get("count", 0)
-            lines.append(f"### {cn} ({strategy_name}) — 权重 {w}")
-            lines.append(f"真实命中 **{count}** 只" +
-                          (f",展示前 {len(hits)} 只" if hits else " — 无命中"))
-            if count < 5:
-                lines.append("> ⚠️ 真实命中不足 5 只,以下候选包含按 KHunter 策略条件接近度的弱信号股,标注「补充候选/低置信度」")
-            if hits:
-                lines.append("")
-                lines.append("| 排名 | 代码 | 名称 | 收盘 | 主要指标 |")
-                lines.append("|---|---|---|---|---|")
-                for i, h in enumerate(hits, 1):
-                    metrics_parts = []
-                    for k, v in h.items():
-                        if k in ("code", "name", "close", "amount"):
-                            continue
-                        if isinstance(v, float):
-                            metrics_parts.append(f"{k}={v:.3f}")
-                        else:
-                            metrics_parts.append(f"{k}={v}")
-                    metrics = " · ".join(metrics_parts[:4]) or "-"
-                    close_str = f"{h.get('close', '-'):.2f}" if isinstance(h.get("close"), (int, float)) else str(h.get("close", "-"))
-                    lines.append(f"| {i} | {h.get('code', '')} | {h.get('name', '')} | {close_str} | {metrics} |")
-            lines.append("")
-    else:
-        lines.append("(无数据)")
-        lines.append("")
-
-    # 综合 Top10
-    lines += ["## 综合 Top10 (跨策略 union + 因子总分)", ""]
-    top = rankings.get("top_overall") or []
+    # ── 选股一览 (Top10 一行带过,让读者第一眼看到名单) ──
     if top:
-        lines.append("| 排名 | 代码 | 名称 | 命中策略 | KH 权重 | 因子总分 | 置信 |")
-        lines.append("|---|---|---|---|---|---|---|")
+        names_line = "  ·  ".join(
+            f"#{i+1} **{it.get('name', '')}** `{it.get('code', '')}` "
+            f"({it.get('total_score', 0):.1f}/10)"
+            if isinstance(it.get("total_score"), (int, float)) and it.get("total_score") == it.get("total_score")
+            else f"#{i+1} **{it.get('name', '')}** `{it.get('code', '')}` (—)"
+            for i, it in enumerate(top[:10])
+        )
+        lines += ["## 🎯 今日选股一览", "", names_line, ""]
+
+    # ── 综合 Top10 详细表 ──
+    lines += ["## 🥇 综合 Top10 详细表", ""]
+    if top:
+        lines.append("| # | 代码 | 名称 | 综合分 | 置信 | 命中策略 | KH权重 | 风险扣分 | 收盘 |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
         for i, it in enumerate(top, 1):
             strats = " / ".join((it.get("strategies_cn") or [])[:3])
             ts = it.get("total_score")
             ts_str = f"{ts:.2f}" if isinstance(ts, (int, float)) and ts == ts else "—"
+            close = it.get("close")
+            close_str = f"{close:.2f}" if isinstance(close, (int, float)) else "—"
+            risk = it.get("risk_penalty") or 0
+            risk_str = f"-{risk:.1f}" if risk > 0 else "—"
             lines.append(
                 f"| {i} | {it.get('code', '')} | {it.get('name', '')} | "
-                f"{strats} | {it.get('max_kh_weight', 0)} | {ts_str} | {it.get('confidence', '?')} |"
+                f"**{ts_str}** | {it.get('confidence', '?')} | {strats} | "
+                f"{it.get('max_kh_weight', 0)} | {risk_str} | {close_str} |"
             )
     else:
         lines.append("(无候选)")
     lines.append("")
 
-    # 风险 Top
+    # ── 风险榜 ──
     risks = rankings.get("top_risk") or []
     if risks:
-        lines += ["## ⚠️ 风险与观察清单", ""]
+        lines += ["## ⚠️ 风险榜", ""]
         lines.append("| 代码 | 名称 | 风险扣分 | 风险点 |")
         lines.append("|---|---|---|---|")
         for it in risks:
             notes = "; ".join((it.get("risk_notes") or [])[:3])
             lines.append(
                 f"| {it.get('code', '')} | {it.get('name', '')} | "
-                f"{it.get('risk_penalty', 0):.2f} | {notes} |"
+                f"-{it.get('risk_penalty', 0):.2f} | {notes} |"
             )
         lines.append("")
 
-    # 低置信度
+    # ── 低置信度榜 ──
     low_conf = rankings.get("top_low_confidence") or []
     if low_conf:
-        lines += ["## 低置信度名单 (数据质量 B/C)", ""]
+        lines += ["## 📉 低置信度榜 (数据质量 B/C)", ""]
         lines.append("| 代码 | 名称 | 置信 | 数据问题 |")
         lines.append("|---|---|---|---|")
         for it in low_conf:
@@ -354,9 +337,7 @@ def build_report_markdown(
             )
         lines.append("")
 
-    # 单股小节(综合 Top10 每只)
-    lines += ["## 个股小节 (综合 Top 10)", ""]
-    # 已接入(K 线衍生)的因子
+    # ── 个股深度 (Top10 每只) — 选股的核心支撑 ──
     factor_names_cn = {
         "momentum_20d": "20 日动量",
         "momentum_60d": "60 日动量",
@@ -368,25 +349,42 @@ def build_report_markdown(
         "today_amount_ratio": "当日活跃度",
         "kh_strategy_weight": "KH 策略权重",
     }
-    # 未接入数据源的因子 — 在 spec 里列出但当前回 NaN,占位透明告知
     factor_names_cn_unsupported = {
         "valuation_pe_pb": "估值 (PE/PB)",
         "growth_yoy": "成长 (营收/利润同比)",
         "quality_roe": "质量 (ROE)",
         "research_heat": "研报/公告热度",
     }
+
+    lines += ["## 📂 个股深度 (Top10 每只 — 命中逻辑 / 交易计划 / 辩论)", ""]
     for i, it in enumerate(top, 1):
         code = it.get("code", "")
         name = it.get("name", "")
         strats = ", ".join(it.get("strategies_cn") or [])
         debate = debates.get(code) or {}
 
-        lines.append(f"### #{i} {code} {name}")
+        lines.append(f"### #{i} {name} {code}")
         lines.append("")
-        # 核心结论:两种来源
+
+        # 1) 一行关键指标 (选股决策最关心的)
+        ts = it.get("total_score")
+        ts_str = f"{ts:.2f}" if isinstance(ts, (int, float)) and ts == ts else "—"
+        risk = it.get("risk_penalty") or 0
+        close = it.get("close")
+        close_str = f"{close:.2f}" if isinstance(close, (int, float)) else "—"
+        lines.append(
+            f"**综合分 {ts_str}/10**  ·  置信度 {it.get('confidence', '?')}  ·  "
+            f"风险扣分 {risk:.2f}  ·  收盘 {close_str}  ·  "
+            f"命中 {len(it.get('strategies_cn') or [])} 类 KH 策略 "
+            f"(最大权重 {it.get('max_kh_weight', 0)})"
+        )
+        lines.append("")
+        lines.append(f"**KHunter 命中策略**: {strats or '(无)'}")
+        lines.append("")
+
+        # 2) 核心结论 (辩论压缩)
         consensus = debate.get("consensus")
         if not consensus:
-            # swarm 模式 — 取 final_report 前 200 字作核心结论摘要
             sw_md = (debate.get("final_report") or "").strip()
             if sw_md:
                 snippet = sw_md.split("\n\n", 1)[0][:250]
@@ -394,61 +392,57 @@ def build_report_markdown(
         if consensus:
             lines.append(f"**核心结论**: {consensus}")
         elif debate.get("status") and debate.get("status") != "completed":
-            lines.append(f"**核心结论**: ⚠️ 辩论未完成(`{debate.get('status')}`),后续可手动 `查一下 {debate.get('run_id', '')}` 看进度")
+            lines.append(
+                f"**核心结论**: ⚠️ 辩论未完成 (`{debate.get('status')}`),"
+                f"完整报告查 run `{debate.get('run_id', '')}`"
+            )
         else:
-            lines.append("**核心结论**: (未生成辩论)")
-        lines.append("")
-        lines.append(f"**KHunter 命中策略**: {strats}  ·  最大权重 {it.get('max_kh_weight', 0)}")
-        ts = it.get("total_score")
-        ts_str = f"{ts:.2f}" if isinstance(ts, (int, float)) and ts == ts else "—"
-        lines.append(f"**因子总分**: {ts_str}  ·  置信度 {it.get('confidence', '?')}  ·  风险扣分 {it.get('risk_penalty', 0):.2f}")
+            lines.append("**核心结论**: (本次未生成辩论)")
         lines.append("")
 
-        # 因子明细表
-        raw = it.get("raw_factors") or {}
-        z = it.get("z_factors") or {}
-        if raw:
-            lines.append("**因子明细**:")
-            lines.append("")
-            lines.append("| 因子 | raw | z | 备注 |")
-            lines.append("|---|---|---|---|")
-            for f_key, cn in factor_names_cn.items():
-                rv = raw.get(f_key)
-                zv = z.get(f_key)
-                rv_str = f"{rv:.3f}" if isinstance(rv, (int, float)) and rv == rv else "NaN"
-                zv_str = f"{zv:.2f}" if isinstance(zv, (int, float)) and zv == zv else "NaN"
-                lines.append(f"| {cn} | {rv_str} | {zv_str} | 已接入 |")
-            # 未接入数据源的因子 — 透明告知,不假装支持
-            for f_key, cn in factor_names_cn_unsupported.items():
-                lines.append(f"| {cn} | NaN | NaN | 未接入数据源 |")
-            # 风险惩罚是独立维度
-            risk = it.get("risk_penalty") or 0
-            lines.append(f"| 风险惩罚 | {risk:.2f} | — | 涨幅/波动/流动性扣分 |")
-            lines.append("")
+        # 3) 交易计划 — 选股报告里最 actionable 的部分,提到辩论之前
+        lines.append("**交易计划** (规则生成):")
+        if isinstance(close, (int, float)):
+            stop_loss = close * 0.93
+            target1 = close * 1.08
+            target2 = close * 1.15
+            lines.append(f"- 触发: 站稳 {close_str},放量阳线确认")
+            lines.append(f"- 失效: 跌破 {close * 0.95:.2f} 或量能持续萎缩")
+            lines.append(f"- 止损: {stop_loss:.2f} (-7%)")
+            lines.append(f"- 止盈: 一档 {target1:.2f} (+8%) / 二档 {target2:.2f} (+15%)")
+        else:
+            lines.append("- (收盘价缺失,无法生成具体止盈止损)")
+        if risk > 1.5:
+            lines.append("- 仓位: **1/10** (高风险)")
+        elif risk > 0.5:
+            lines.append("- 仓位: **1/7** (有风险)")
+        else:
+            lines.append("- 仓位: **1/5** (常规)")
+        lines.append("- 跟踪: 每个交易日盘后复盘")
+        lines.append("")
 
-        # 辩论部分:两种格式
-        # 1) swarm 模式 (debate.final_report 是完整 markdown)
-        # 2) LLM 模式 (debate.bulls/bears/... 结构化 JSON)
+        # 4) 多专家辩论展开
         swarm_md = (debate.get("final_report") or "").strip()
         swarm_status = debate.get("status", "")
         if swarm_md and swarm_status == "completed":
-            lines.append("**多专家辩论报告 (swarm investment_committee)**:")
+            lines.append("**多专家投委会辩论** (swarm bull/bear/risk/PM):")
             lines.append("")
-            lines.append(f"> run_id: `{debate.get('run_id', '')}` · "
-                          f"elapsed {debate.get('elapsed', 0):.0f}s · "
-                          f"完整投委会(bull/bear/risk/PM)四 agent 协作产出")
+            lines.append(
+                f"> run_id `{debate.get('run_id', '')}` · "
+                f"elapsed {debate.get('elapsed', 0):.0f}s"
+            )
             lines.append("")
-            # swarm markdown 可能很长,直接贴入(docx max_blocks 已放宽)
-            lines.append(swarm_md)
+            lines.append(_demote_markdown_headings(swarm_md))
             lines.append("")
         elif swarm_status and swarm_status != "completed":
-            lines.append(f"**多专家辩论 (swarm)**: ❌ 未完成 — status=`{swarm_status}`,"
-                          f"error: {debate.get('error', '')}")
-            lines.append(f"run_id: `{debate.get('run_id', '')}` · "
-                          f"elapsed {debate.get('elapsed', 0):.0f}s")
+            lines.append(
+                f"**多专家辩论**: ❌ 未完成 — status `{swarm_status}`,"
+                f"error: {debate.get('error', '')}  ·  "
+                f"run_id `{debate.get('run_id', '')}`"
+            )
             lines.append("")
         else:
-            # LLM 模式(legacy 结构化 JSON)
+            # LLM 模式 (structured JSON)
             if debate.get("bulls"):
                 lines.append("**多方观点**:")
                 for b in debate["bulls"]:
@@ -468,39 +462,109 @@ def build_report_markdown(
                 lines.append("**游资视角**:")
                 for g in debate["guru_takeaways"]:
                     if isinstance(g, dict):
-                        lines.append(f"- **{g.get('guru', '游资')}**({g.get('school', '')}): {g.get('view', '')}")
+                        lines.append(
+                            f"- **{g.get('guru', '游资')}** ({g.get('school', '')}): "
+                            f"{g.get('view', '')}"
+                        )
                 lines.append("")
             if debate.get("next_day_validation"):
                 lines.append(f"**次日验证**: {debate['next_day_validation']}")
                 lines.append("")
 
-        # 简易交易计划(规则生成 — 不靠 LLM 编)
-        lines.append("**交易计划**(规则生成,仅供参考):")
-        close = it.get("close")
-        close_str = f"{close:.2f}" if isinstance(close, (int, float)) else "?"
-        if isinstance(close, (int, float)):
-            stop_loss = close * 0.93
-            target1 = close * 1.08
-            target2 = close * 1.15
-            lines.append(f"- 触发条件: 站稳 {close_str},放量阳线确认")
-            lines.append(f"- 失效条件: 跌破 {close * 0.95:.2f} 或量能持续萎缩")
-            lines.append(f"- 止损: {stop_loss:.2f} (-7%)")
-            lines.append(f"- 止盈: 一档 {target1:.2f} (+8%) / 二档 {target2:.2f} (+15%)")
-        else:
-            lines.append("- (收盘价缺失,无法生成具体止盈止损)")
-        risk = it.get("risk_penalty") or 0
-        if risk > 1.5:
-            lines.append("- 仓位建议: 1/10 (高风险,小仓位试)")
-        elif risk > 0.5:
-            lines.append("- 仓位建议: 1/7 (有风险,半仓试)")
-        else:
-            lines.append("- 仓位建议: 1/5 (常规)")
-        lines.append("- 跟踪频率: 每个交易日盘后复盘")
-        lines.append("")
+        # 5) 因子明细 (附录性质 — 评分的支撑数据)
+        raw = it.get("raw_factors") or {}
+        z = it.get("z_factors") or {}
+        if raw:
+            lines.append("**因子明细 (附录)**")
+            lines.append("")
+            lines.append("| 因子 | raw | z | 备注 |")
+            lines.append("|---|---|---|---|")
+            for f_key, cn in factor_names_cn.items():
+                rv = raw.get(f_key)
+                zv = z.get(f_key)
+                rv_str = f"{rv:.3f}" if isinstance(rv, (int, float)) and rv == rv else "NaN"
+                zv_str = f"{zv:.2f}" if isinstance(zv, (int, float)) and zv == zv else "NaN"
+                lines.append(f"| {cn} | {rv_str} | {zv_str} | 已接入 |")
+            for f_key, cn in factor_names_cn_unsupported.items():
+                lines.append(f"| {cn} | NaN | NaN | 未接入数据源 |")
+            lines.append(
+                f"| 风险惩罚 | {risk:.2f} | — | 涨幅/波动/流动性扣分 |"
+            )
+            lines.append("")
 
-    lines += ["", "---",
-              "**免责声明**: 以上为量化研究与历史回测/扫描,不构成投资建议。",
-              ""]
+    # ── 11 类策略命中明细 (支撑材料,挪到 Top10 之后) ──
+    lines += ["## 🧪 11 类策略命中明细 (支撑材料)", ""]
+    daily = scan_result.get("daily_results") or []
+    if daily:
+        last_day = daily[-1]
+        strats_dict = last_day.get("strategies") or {}
+        ordered = sorted(
+            strats_dict.items(),
+            key=lambda kv: (weights.get(kv[0], 0), kv[1].get("count", 0)),
+            reverse=True,
+        )
+        for strategy_name, info in ordered:
+            cn = names_cn.get(strategy_name, strategy_name)
+            w = weights.get(strategy_name, 0)
+            hits = info.get("top") or []
+            count = info.get("count", 0)
+            lines.append(f"### {cn}  ·  权重 {w}  ·  命中 {count} 只")
+            if count < 5 and hits:
+                lines.append("> ⚠️ 真实命中不足 5 只,以下含按策略条件接近度的弱信号股")
+            if hits:
+                lines.append("")
+                lines.append("| # | 代码 | 名称 | 收盘 | 主要指标 |")
+                lines.append("|---|---|---|---|---|")
+                for j, h in enumerate(hits, 1):
+                    metrics_parts = []
+                    for k, v in h.items():
+                        if k in ("code", "name", "close", "amount"):
+                            continue
+                        if isinstance(v, float):
+                            metrics_parts.append(f"{k}={v:.3f}")
+                        else:
+                            metrics_parts.append(f"{k}={v}")
+                    metrics = " · ".join(metrics_parts[:4]) or "-"
+                    close_str = (f"{h.get('close', '-'):.2f}"
+                                  if isinstance(h.get("close"), (int, float))
+                                  else str(h.get("close", "-")))
+                    lines.append(
+                        f"| {j} | {h.get('code', '')} | {h.get('name', '')} | "
+                        f"{close_str} | {metrics} |"
+                    )
+            else:
+                lines.append("无命中。")
+            lines.append("")
+    else:
+        lines += ["(无 daily_results 数据)", ""]
+
+    # ── 方法 & 数据 (注脚) ──
+    lines += [
+        "## 📚 方法说明 & 数据 (注脚)", "",
+        "**选股流程**: 11 类技术策略扫描 → 候选股 union → 横截面 9 因子 z-score "
+        "→ 风险扣分 → 综合分 (0-10) → Top10 多专家辩论。",
+        "",
+        f"- 数据源: {scan_result.get('data_source') or '?'}",
+        f"- 股池: {params.get('universe_label', '?')} (按成交额排序)",
+        f"- 回看窗口: {params.get('days', '?')} 个交易日,K 线历史 "
+        f"{params.get('datalen', '?')} 条",
+        f"- 实际抓取: {cov.get('fetched_symbols', '?')}/"
+        f"{cov.get('requested_symbols', '?')} 只 (失败 {cov.get('error_symbols', '?')})",
+        f"- 耗时: {cov.get('elapsed_seconds', '?')} 秒",
+        f"- 输出目录: {analysis_date}-khunter-a-share-daily/",
+        "",
+        "**已接入个股因子**: 20/60 日动量, 20 日波动, 20 日换手代理, 量价相关, "
+        "资金流代理, 距 MA20, 当日活跃度, KH 策略权重",
+        "",
+        "**未接入因子(占位)**: 估值 (PE/PB)、成长 (同比)、质量 (ROE)、研报热度 "
+        "— 当前数据源仅覆盖量价/资金面。估值/基本面因子需另接腾讯财经 + 东财研报接口。",
+        "",
+        "**置信度档位**: A 数据完整且 KH 强信号 / B 数据不足或弱信号 / C 数据质量差",
+        "",
+        "---",
+        "**免责声明**: 以上为量化研究与历史回测/扫描,不构成投资建议。",
+        "",
+    ]
     return "\n".join(lines)
 
 
