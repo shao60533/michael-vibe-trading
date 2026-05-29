@@ -76,13 +76,17 @@ def run_weekly_scan(
             StockMeta(code=c.strip(), name=c.strip(), sina_symbol=to_sina_symbol(c.strip()))
             for c in symbols if c.strip()
         ]
+        universe_label = f"指定股票 {len(universe)} 只"
+        universe_source = "manual symbols"
     else:
         try:
             universe = fetch_active_universe(max_symbols, include_st=include_st)
+            universe_source = "Eastmoney/Sina amount ranking (auto fallback)"
         except Exception as exc:
             raise KHunterScanError(
                 f"获取活跃股池失败 — 东财/新浪 fallback 都挂: "
                 f"{type(exc).__name__}: {exc}") from exc
+        universe_label = f"成交额排序前 {len(universe)} 只"
     if not universe:
         raise KHunterScanError("活跃股池为空")
 
@@ -115,6 +119,8 @@ def run_weekly_scan(
         "parameters": {
             "workspace": workspace, "days": days,
             "max_symbols": len(universe), "datalen": datalen,
+            "universe_label": universe_label,
+            "universe_source": universe_source,
             "top_per_strategy": top_per_strategy, "top_union": top_union,
             "end_date": end_date or "",
         },
