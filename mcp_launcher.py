@@ -5293,8 +5293,12 @@ async def _lifespan(app):
                 print(f"[feishu] notion sync: enabled ({parent_desc})", flush=True)
             else:
                 print("[feishu] notion sync: disabled", flush=True)
-            # 启动每日热点推送 scheduler (仅当 DAILY_HOT_EVENT_CHAT_ID 已设)
-            asyncio.create_task(_daily_hot_event_scheduler())
+            # 注:每日 hot-event scheduler 已停用 (2026-05-30 起,由 KHunter 盘前
+            #     日报 + 盘中异动 3 时点推送替代)。用户主动「热点 X 概念」/「分析 X」
+            #     仍可手动触发 hot_event_research。如需恢复定时推送,把下面这行解开即可。
+            # asyncio.create_task(_daily_hot_event_scheduler())
+            print("[scheduler] daily hot-event 已硬停用 (代码层),"
+                  "用 KHunter 盘前日报 + 盘中异动卡片替代", flush=True)
             # 启动工作日盘前 KHunter scheduler (仅当 DAILY_KHUNTER_CHAT_ID 已设)
             asyncio.create_task(_daily_khunter_scheduler())
             # 启动盘中异动 3 时点推送 (仅当 INTRADAY_CHAT_ID 已设)
