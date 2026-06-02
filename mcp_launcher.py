@@ -4459,32 +4459,11 @@ async def _feishu_handle_khunter_pipeline(chat_id: str,
         pipeline_timeout = min(KHUNTER_HARD_TIMEOUT, 900)  # ≤15min
     else:
         pipeline_timeout = KHUNTER_HARD_TIMEOUT
-    if debate_mode == "swarm":
-        est = f"约 {top_n} × 10-15 分钟 swarm 串行 + 扫描 5 分钟 ≈ 2-3 小时"
-    else:
-        est = "约 3-6 分钟"
-    _feishu_send_text(chat_id, "chat_id",
-        f"🎯 开始 KHunter A 股日报 pipeline\n"
-        f"(11 策略扫描 {max_symbols} 只 × {days} 天 → 个股因子评分 → "
-        f"多专家辩论 Top{top_n} [{debate_mode} 模式])\n"
-        f"{est},硬超时 {pipeline_timeout}s,完成后推回 卡片 + 飞书文档 + Notion。"
-        + ("\n中途会发进度更新,慢慢跑请稍等。" if debate_mode == "swarm" else ""))
 
-    # 进度回调 — swarm 模式每 2 只发一条
-    last_progress: dict = {"sent_at_idx": 0}
-    async def _progress_cb(idx: int, total: int, code: str, name: str,
-                            status: str, elapsed: float) -> None:
-        # 每 2 只 或 最后一只 发
-        if idx - last_progress["sent_at_idx"] < 2 and idx != total:
-            return
-        last_progress["sent_at_idx"] = idx
-        emoji = "✅" if status == "completed" else "⚠️"
-        try:
-            _feishu_send_text(chat_id, "chat_id",
-                f"🎯 KHunter 辩论进度 {idx}/{total}  "
-                f"{emoji} {code} {name} ({status}, {elapsed:.0f}s)")
-        except Exception as exc:
-            print(f"[khunter] progress send err: {exc}", flush=True)
+    # 静默执行 — 用户反馈「不用回复,直接给结果卡片就行」。
+    # 启动 ack + 中途 swarm 辩论进度都不再发,只在 pipeline 失败时发错误文本。
+    print(f"[khunter] start chat={chat_id} mode={debate_mode} "
+          f"timeout={pipeline_timeout}s", flush=True)
 
     try:
         from khunter_x import run_khunter_pipeline_async, KHunterScanError
@@ -4494,7 +4473,7 @@ async def _feishu_handle_khunter_pipeline(chat_id: str,
                 enable_debate=True, write_files=True,
                 debate_mode=debate_mode,
                 swarm_timeout_per_run=KHUNTER_SWARM_TIMEOUT_PER_RUN,
-                progress_callback=(_progress_cb if debate_mode == "swarm" else None),
+                progress_callback=None,
             ),
             timeout=pipeline_timeout,
         )
