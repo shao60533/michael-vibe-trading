@@ -33,19 +33,32 @@ class EastMoneyError(Exception):
     """Hard failure fetching from EastMoney push2."""
 
 
-def _get_json(url: str, timeout: float = 10.0) -> dict[str, Any]:
-    req = urllib.request.Request(url, headers=_HEADERS)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8", "replace")
-    except Exception as exc:
-        raise EastMoneyError(
-            f"network err {type(exc).__name__}: {exc} url={url[:120]}") from exc
-    try:
-        return json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise EastMoneyError(
-            f"non-JSON body[0:200]={body[:200]!r}") from exc
+def _get_json(url: str, timeout: float = 10.0,
+              retries: int = 3, backoff_sec: float = 0.4) -> dict[str, Any]:
+    """带 retry — push2 实测 nginx 负载均衡间歇 502,重试常能换到健康节点。"""
+    import time as _time
+    last_exc: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=_HEADERS)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8", "replace")
+            try:
+                return json.loads(body)
+            except json.JSONDecodeError as exc:
+                raise EastMoneyError(
+                    f"non-JSON body[0:200]={body[:200]!r}") from exc
+        except EastMoneyError:
+            raise  # JSON 错不重试
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                _time.sleep(backoff_sec * attempt)
+                continue
+    raise EastMoneyError(
+        f"network err after {retries} retries: "
+        f"{type(last_exc).__name__}: {last_exc} url={url[:120]}"
+    ) from last_exc
 
 
 # ─────────── Boards (概念 / 行业) ───────────
