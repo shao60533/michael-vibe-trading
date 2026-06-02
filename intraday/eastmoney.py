@@ -192,11 +192,20 @@ def fetch_snapshot(top_boards: int = 10, top_limit_up: int = 5,
                    include_industry: bool = False) -> dict[str, Any]:
     """一次取板块 + 涨停,过滤负涨幅板块,返回字典。
 
-    任一接口失败抛 EastMoneyError(上层决定要不要 partial fail)。
+    设计: 板块榜单失败 → 返空 list + 在 boards_error 标错(prod 2026-06-02
+    起 push2 clist/get 时不时 502)。涨停池 push2ex 仍稳定。
+    涨停池失败才抛 EastMoneyError。
     """
-    boards_concept = fetch_concept_boards(limit=max(top_boards * 2, 30))
-    # 只保留涨的(负的代表跌幅板块,异动定义里只看涨)
-    boards_concept = [b for b in boards_concept if b.pct > 0][:top_boards]
+    boards_concept: list[BoardSnapshot] = []
+    boards_error: str | None = None
+    try:
+        boards_concept = fetch_concept_boards(limit=max(top_boards * 2, 30))
+        # 只保留涨的(负的代表跌幅板块,异动定义里只看涨)
+        boards_concept = [b for b in boards_concept if b.pct > 0][:top_boards]
+    except EastMoneyError as exc:
+        boards_error = f"{type(exc).__name__}: {exc}"
+        print(f"[intraday/em] concept boards fetch failed (graceful): "
+              f"{boards_error}", flush=True)
 
     boards_industry: list[BoardSnapshot] = []
     if include_industry:
@@ -213,6 +222,7 @@ def fetch_snapshot(top_boards: int = 10, top_limit_up: int = 5,
     return {
         "boards_concept": boards_concept,
         "boards_industry": boards_industry,
+        "boards_error": boards_error,
         "limit_up_top": pool_top,
         "limit_up_total": total_zt,
         "limit_up_all": pool,

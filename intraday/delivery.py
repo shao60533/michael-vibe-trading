@@ -196,6 +196,15 @@ def build_intraday_report_markdown(snap: dict[str, Any],
                 f"{b.leader_pct:+.2f}% {_pct_heat(b.leader_pct)} | {kh_col} |"
             )
         lines.append("")
+    elif snap.get("boards_error"):
+        lines += [
+            "## 🥇 异动板块 Top 20",
+            "",
+            f"> ⚠️ 板块榜单数据源临时不可用 (EastMoney push2 `clist/get` 502)",
+            f"> 报错: `{snap.get('boards_error')}`",
+            "> 涨停股池 + 选股不受影响。本次选股全部来自涨停股(板块领涨补位 0 只)。",
+            "",
+        ]
 
     # ── KHunter 串联 section ──
     if kh.loaded_count > 0 and zt_with_kh:

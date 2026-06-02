@@ -113,6 +113,9 @@ async def build_snapshot(top_boards: int = 10, top_limit_up: int = 5,
     return {
         "ts_bj": now,
         "boards_concept": snap["boards_concept"],
+        "boards_error": snap.get("boards_error"),
+        "limit_up_top": snap["limit_up_top"],
+        "limit_up_all": snap["limit_up_all"],
         "limit_up_total": snap["limit_up_total"],
         "kh_index": kh_index,
         "picks": picks,
@@ -192,6 +195,16 @@ def render_feishu_card(snap: dict[str, Any],
             "tag": "div",
             "text": {"tag": "lark_md",
                       "content": "**📊 异动板块速览**\n" + "\n".join(brief_lines)},
+        })
+    elif snap.get("boards_error"):
+        # 板块数据源临时不可用 — 显式告知,卡片不挂(选股仍可用)
+        elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md",
+                      "content": ("**📊 异动板块速览**\n"
+                                   "⚠️ 板块榜单数据源临时不可用 (EastMoney push2 "
+                                   "`clist/get` 502),涨停股池 + 选股不受影响")},
         })
 
     # 链接按钮
