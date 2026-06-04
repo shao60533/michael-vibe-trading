@@ -33,14 +33,36 @@ class EastMoneyError(Exception):
     """Hard failure fetching from EastMoney push2."""
 
 
+# push2 是一组 nginx 镜像节点,同一时刻部分节点会 502/挂起。原来的 retry
+# 一直打同一个 host,所谓"换健康节点"并没发生 —— 这里真正轮换镜像。
+_PUSH2_MIRRORS = (
+    "push2.eastmoney.com", "1.push2.eastmoney.com", "7.push2.eastmoney.com",
+    "13.push2.eastmoney.com", "29.push2.eastmoney.com",
+    "48.push2.eastmoney.com", "92.push2.eastmoney.com",
+)
+
+
+def _rotate_push2_host(url: str, attempt: int) -> str:
+    """把 push2.eastmoney.com 轮换到不同镜像节点。
+
+    只动 push2.eastmoney.com;push2ex(涨停池)等其它 host 原样返回。
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.netloc != "push2.eastmoney.com":
+        return url
+    mirror = _PUSH2_MIRRORS[attempt % len(_PUSH2_MIRRORS)]
+    return parts._replace(netloc=mirror).geturl()
+
+
 def _get_json(url: str, timeout: float = 10.0,
-              retries: int = 3, backoff_sec: float = 0.4) -> dict[str, Any]:
-    """带 retry — push2 实测 nginx 负载均衡间歇 502,重试常能换到健康节点。"""
+              retries: int = 6, backoff_sec: float = 0.4) -> dict[str, Any]:
+    """带 retry + 镜像轮换 — push2 nginx 负载均衡间歇 502,换台节点常能命中。"""
     import time as _time
     last_exc: Exception | None = None
     for attempt in range(1, retries + 1):
+        try_url = _rotate_push2_host(url, attempt - 1)
         try:
-            req = urllib.request.Request(url, headers=_HEADERS)
+            req = urllib.request.Request(try_url, headers=_HEADERS)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 body = resp.read().decode("utf-8", "replace")
             try:
@@ -115,9 +137,55 @@ def _fetch_boards(fs: str, limit: int) -> list[BoardSnapshot]:
     return out
 
 
+def _fetch_concept_boards_sina(limit: int) -> list[BoardSnapshot]:
+    """独立兜底源(与 push2 不同集群):Sina 板块榜 newFLJK。
+
+    2026-06 实测 push2 概念板块网关可整段 502(镜像轮换也救不回),而 Sina
+    仍可达。GBK 编码,逗号分隔字段:
+      code,name,n,avg_price,avg_chg,涨跌幅%,vol,amount,
+      leader_code,leader_price,leader_chg,leader_pct,leader_name
+    实测 Sina 领涨股字段不可靠(会给出 >20% 的不可能值)→ 只取板块名 + 涨幅,
+    领涨股留空,不塞假数据(领涨个股仍由涨停池提供)。
+    """
+    url = ("https://vip.stock.finance.sina.com.cn/q/view/"
+           "newFLJK.php?param=class")
+    req = urllib.request.Request(
+        url, headers={**_HEADERS, "Referer": "https://finance.sina.com.cn/"})
+    with urllib.request.urlopen(req, timeout=10.0) as resp:
+        body = resp.read().decode("gbk", "replace")
+    try:
+        obj = json.loads(body[body.index("{"):body.rindex("}") + 1])
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise EastMoneyError(f"sina boards parse err: {exc}") from exc
+    out: list[BoardSnapshot] = []
+    for _key, val in obj.items():
+        f = str(val).split(",")
+        if len(f) < 6:
+            continue
+        try:
+            out.append(BoardSnapshot(
+                code=str(f[0]), name=str(f[1]), pct=float(f[5]),
+                main_inflow=0.0, leader_name="", leader_code="",
+                leader_pct=0.0,
+            ))
+        except (TypeError, ValueError):
+            continue
+    out.sort(key=lambda b: b.pct, reverse=True)
+    return out[:limit]
+
+
 def fetch_concept_boards(limit: int = 50) -> list[BoardSnapshot]:
-    """概念板块 Top N 按涨幅降序(包含负数,需调用方再过滤)。"""
-    return _fetch_boards("m:90+t:3", limit)
+    """概念板块 Top N 按涨幅降序(包含负数,需调用方再过滤)。
+
+    push2(含镜像轮换)整段不可用时,自动兜底到 Sina 独立源;两边都失败
+    才抛 EastMoneyError(由 fetch_snapshot 优雅降级)。
+    """
+    try:
+        return _fetch_boards("m:90+t:3", limit)
+    except EastMoneyError as exc:
+        print(f"[intraday/em] push2 concept boards down, "
+              f"fallback to Sina: {exc}", flush=True)
+        return _fetch_concept_boards_sina(limit)
 
 
 def fetch_industry_boards(limit: int = 30) -> list[BoardSnapshot]:
