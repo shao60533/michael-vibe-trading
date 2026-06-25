@@ -33,7 +33,7 @@ FACTOR_WEIGHTS = {
     "momentum_60d": 12,       # 60 日动量
     "volatility_20d": -8,     # 波动率(负权,越低越好)
     "turnover_20d": 8,        # 换手率
-    "price_volume_corr": 6,   # 量价结构
+    "price_volume_corr": -6,  # 量价相关性(负权:回测显示低相关反而跑赢,cord/corr 为负IC IR≈-.24~-.31)
     "money_flow_proxy": 18,   # 资金流代理(净流入 / 总额)
     "ma20_relative": 8,       # 距 20MA 相对位置
     "today_amount_ratio": 12, # 当日活跃度
