@@ -1289,6 +1289,51 @@ def _feishu_send_long(receive_id: str, receive_id_type: str, text: str, chunk_si
         _feishu_send_text(receive_id, receive_id_type, prefix + part)
 
 
+def _feishu_upload_image(png_bytes: bytes) -> str | None:
+    """上传图片到飞书,返回 image_key。失败返回 None。"""
+    token = _feishu_get_tenant_token()
+    files = {
+        "image_type": (None, "message"),
+        "image": ("recap.png", png_bytes, "image/png"),
+    }
+    try:
+        with httpx.Client(timeout=60) as c:
+            r = c.post(
+                "https://open.feishu.cn/open-apis/im/v1/images",
+                headers={"Authorization": f"Bearer {token}"},
+                files=files,
+            )
+            d = r.json()
+        if d.get("code") != 0:
+            print(f"[feishu] image upload failed: {d}", file=sys.stderr, flush=True)
+            return None
+        return d["data"]["image_key"]
+    except Exception as exc:
+        print(f"[feishu] image upload exception: {type(exc).__name__}: {exc}",
+              file=sys.stderr, flush=True)
+        return None
+
+
+def _feishu_send_image(receive_id: str, receive_id_type: str, image_key: str) -> dict:
+    """发送图片消息到飞书会话。"""
+    token = _feishu_get_tenant_token()
+    body = {
+        "receive_id": receive_id,
+        "msg_type": "image",
+        "content": json.dumps({"image_key": image_key}, ensure_ascii=False),
+    }
+    with httpx.Client(timeout=15) as c:
+        r = c.post(
+            f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_id_type}",
+            headers={"Authorization": f"Bearer {token}"},
+            json=body,
+        )
+        d = r.json()
+        if d.get("code") != 0:
+            print(f"[feishu] send image failed: {d}", file=sys.stderr, flush=True)
+        return d
+
+
 # Asset extractor — explicit ticker formats only.
 # Named-entity resolution (苹果 → AAPL, 茅台 → 600519.SH, etc.) is delegated
 # entirely to the LLM router. The regex below is a strict fallback used only
@@ -4831,6 +4876,124 @@ async def _daily_khunter_scheduler() -> None:
         await asyncio.sleep(120)  # KHunter 跑完已经 ~5min,这里 +2min buffer
 
 
+# ── 收盘复盘长图推送 (KHunter recap) ──
+DAILY_RECAP_CHAT_ID = (os.environ.get("DAILY_RECAP_CHAT_ID", "").strip()
+                       or DAILY_KHUNTER_CHAT_ID)
+_DAILY_RECAP_TIMES_RAW = os.environ.get("DAILY_RECAP_TIMES", "15:35").strip()
+DAILY_RECAP_ENABLED = (os.environ.get("DAILY_RECAP_ENABLED", "true")
+                       .strip().lower() in ("1", "true", "yes", "on"))
+DAILY_RECAP_WEEKDAYS_ONLY = (os.environ.get("DAILY_RECAP_WEEKDAYS_ONLY", "true")
+                             .strip().lower() in ("1", "true", "yes", "on"))
+DAILY_RECAP_RUN_ON_BOOT = (os.environ.get("DAILY_RECAP_RUN_ON_BOOT", "false")
+                           .strip().lower() in ("1", "true", "yes", "on"))
+
+
+def _parse_recap_times(raw: str) -> list[tuple[int, int]]:
+    out: set[tuple[int, int]] = set()
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if ":" not in tok:
+            continue
+        hh, mm = tok.split(":", 1)
+        try:
+            h, m = int(hh), int(mm)
+        except ValueError:
+            continue
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            out.add((h, m))
+    return sorted(out) or [(15, 35)]
+
+
+DAILY_RECAP_TIMES = _parse_recap_times(_DAILY_RECAP_TIMES_RAW)
+
+
+def _next_recap_dt(times: list[tuple[int, int]], tz_offset: int,
+                   weekdays_only: bool = True):
+    import datetime
+    tz = datetime.timezone(datetime.timedelta(hours=tz_offset))
+    now = datetime.datetime.now(tz)
+    for day_offset in range(0, 8):
+        dt_base = now + datetime.timedelta(days=day_offset)
+        if weekdays_only and dt_base.weekday() >= 5:
+            continue
+        for h, m in times:
+            cand = dt_base.replace(hour=h, minute=m, second=0, microsecond=0)
+            if cand > now:
+                return cand
+    return now + datetime.timedelta(days=1)
+
+
+async def _do_daily_khunter_recap_push(chat_id: str) -> None:
+    """生成今日收盘复盘长图并推送到飞书群。无最新选股则跳过。"""
+    print(f"[scheduler/recap] start chat={chat_id}", flush=True)
+    try:
+        from khunter_x import recap as _recap
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, _recap.build_recap_data)
+        if not data:
+            print("[scheduler/recap] 无最新选股数据,跳过", flush=True)
+            return
+        out_path = "/tmp/khunter_recap.png"
+        png = await loop.run_in_executor(
+            None, _recap.render_recap_png, data, out_path)
+        ts = data["today_stats"]
+        sign = "+" if ts["avg"] >= 0 else ""
+        cap = (f"📊 KHunter 收盘复盘 · {data['today_date']} 选股\n"
+               f"{ts['n']} 笔 · 平均 {sign}{ts['avg']:.2f}% · "
+               f"胜率 {ts['winrate']:.0f}% · 详见长图 👇")
+        await loop.run_in_executor(None, _feishu_send_text, chat_id, "chat_id", cap)
+        image_key = await loop.run_in_executor(None, _feishu_upload_image, png)
+        if not image_key:
+            print("[scheduler/recap] 图片上传失败", flush=True)
+            return
+        await loop.run_in_executor(
+            None, _feishu_send_image, chat_id, "chat_id", image_key)
+        print(f"[scheduler/recap] pushed ok date={data['today_date']} "
+              f"n={ts['n']}", flush=True)
+    except Exception as exc:
+        import traceback
+        print(f"[scheduler/recap] exception: {type(exc).__name__}: {exc}\n"
+              f"{traceback.format_exc()}", flush=True)
+
+
+async def _daily_khunter_recap_scheduler() -> None:
+    """工作日盘后(默认北京 15:35)推送 KHunter 收盘复盘长图。"""
+    if not DAILY_RECAP_ENABLED:
+        print("[scheduler/recap] DAILY_RECAP_ENABLED=false,禁用", flush=True)
+        return
+    if not DAILY_RECAP_CHAT_ID:
+        print("[scheduler/recap] 无 chat_id,禁用 "
+              "(设 DAILY_RECAP_CHAT_ID 或 DAILY_KHUNTER_CHAT_ID)", flush=True)
+        return
+    print(f"[scheduler/recap] enabled: chat={DAILY_RECAP_CHAT_ID} "
+          f"times={DAILY_RECAP_TIMES} (UTC+{DAILY_KHUNTER_TZ_OFFSET}) "
+          f"weekdays_only={DAILY_RECAP_WEEKDAYS_ONLY} "
+          f"run_on_boot={DAILY_RECAP_RUN_ON_BOOT}", flush=True)
+    if DAILY_RECAP_RUN_ON_BOOT:
+        await asyncio.sleep(20)  # 等 KHunter 数据/网络就绪
+        print("[scheduler/recap] RUN_ON_BOOT 立即推送一次", flush=True)
+        await _do_daily_khunter_recap_push(DAILY_RECAP_CHAT_ID)
+    import datetime
+    while True:
+        next_run = _next_recap_dt(DAILY_RECAP_TIMES, DAILY_KHUNTER_TZ_OFFSET,
+                                  weekdays_only=DAILY_RECAP_WEEKDAYS_ONLY)
+        now = datetime.datetime.now(next_run.tzinfo)
+        wait_sec = max(1.0, (next_run - now).total_seconds())
+        print(f"[scheduler/recap] next push at {next_run.isoformat()} "
+              f"(wait {wait_sec/3600:.1f}h)", flush=True)
+        try:
+            await asyncio.sleep(wait_sec)
+        except asyncio.CancelledError:
+            print("[scheduler/recap] cancelled", flush=True)
+            return
+        try:
+            await _do_daily_khunter_recap_push(DAILY_RECAP_CHAT_ID)
+        except Exception as exc:
+            print(f"[scheduler/recap] push failed: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+        await asyncio.sleep(90)
+
+
 # ── 盘中异动推送 (intraday) ──
 # 3 时点定时 + 用户主动触发 + KHunter Top20 个股因子分串联
 
@@ -4901,8 +5064,9 @@ async def _feishu_handle_intraday_request(chat_id: str,
     print(f"[intraday] start chat={chat_id} label={label}", flush=True)
     try:
         snap = await asyncio.wait_for(
-            intraday_svc.build_snapshot(top_boards=20, top_picks=10),
-            timeout=30,
+            intraday_svc.build_snapshot(top_boards=20, top_picks=10,
+                                        top_sectors=5, movers_per_sector=4),
+            timeout=45,
         )
     except Exception as exc:
         print(f"[intraday] snapshot failed: {type(exc).__name__}: {exc}",
@@ -5280,6 +5444,8 @@ async def _lifespan(app):
                   "用 KHunter 盘前日报 + 盘中异动卡片替代", flush=True)
             # 启动工作日盘前 KHunter scheduler (仅当 DAILY_KHUNTER_CHAT_ID 已设)
             asyncio.create_task(_daily_khunter_scheduler())
+            # 启动工作日盘后 KHunter 收盘复盘长图推送 (默认北京 15:35)
+            asyncio.create_task(_daily_khunter_recap_scheduler())
             # 启动盘中异动 3 时点推送 (仅当 INTRADAY_CHAT_ID 已设)
             asyncio.create_task(_intraday_scheduler())
         else:
