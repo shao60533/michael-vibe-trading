@@ -9,6 +9,7 @@ Flow:
 """
 from __future__ import annotations
 
+import asyncio
 import datetime
 import time
 from dataclasses import dataclass
@@ -93,31 +94,54 @@ def _assemble_picks(snap: dict[str, Any],
     return picks_lu + picks_leader
 
 
-def _build_sector_movers(boards: list[eastmoney.BoardSnapshot],
-                         kh: khunter_link.KHunterIndex,
-                         top_sectors: int,
-                         movers_per_sector: int) -> list[dict[str, Any]]:
-    """对 Top 异动板块逐个抓成分股,挑板块内异动个股(主力净流入降序)。
+def _leader_as_member(b: eastmoney.BoardSnapshot) -> list[eastmoney.BoardMember]:
+    """成分股拿不到时,用板块榜单自带的领涨股顶上(main_inflow=0 表示未知)。"""
+    if not b.leader_code:
+        return []
+    return [eastmoney.BoardMember(
+        code=b.leader_code, name=b.leader_name, price=0.0,
+        pct=b.leader_pct, main_inflow=0.0,
+        is_limit_up=(b.leader_pct >= eastmoney._limit_pct_for(b.leader_code) - 0.6),
+    )]
+
+
+async def _build_sector_movers(boards: list[eastmoney.BoardSnapshot],
+                               kh: khunter_link.KHunterIndex,
+                               top_sectors: int,
+                               movers_per_sector: int) -> list[dict[str, Any]]:
+    """对 Top 异动板块**并发**抓成分股,挑板块内异动个股(主力净流入降序)。
 
     板块排序: 有主力净流入数据时按资金降序(异动信号),否则保留涨幅序。
-    push2 成分股不可用的板块优雅跳过(只展示板块,不展示个股)。
+    成分股拿不到的板块 → 用领涨股兜底,绝不显示"暂不可用"(除非连领涨股也没有)。
+    并发 + 镜像轮换重试,既稳又不拖慢整体(总耗时≈最慢的单个板块)。
     """
     ranked = list(boards)
     if any(b.main_inflow for b in ranked):
         ranked = sorted(ranked, key=lambda b: b.main_inflow, reverse=True)
+    targets = ranked[:top_sectors]
 
-    out: list[dict[str, Any]] = []
-    for b in ranked[:top_sectors]:
+    async def _fetch(b: eastmoney.BoardSnapshot) -> list[eastmoney.BoardMember]:
         try:
-            mem = eastmoney.fetch_board_members(b.code, limit=30, retries=2)
+            return await asyncio.to_thread(
+                eastmoney.fetch_board_members, b.code, 30, 4)
         except eastmoney.EastMoneyError as exc:
             print(f"[intraday/em] board members {b.code} {b.name} down: {exc}",
                   flush=True)
-            mem = []
+            return []
+        except Exception as exc:  # noqa: BLE001
+            print(f"[intraday/em] board members {b.code} err: {exc}", flush=True)
+            return []
+
+    results = await asyncio.gather(*[_fetch(b) for b in targets])
+
+    out: list[dict[str, Any]] = []
+    for b, mem in zip(targets, results):
+        zt = sum(1 for m in mem if m.is_limit_up)
         movers = [m for m in mem if m.pct >= 2.0][:movers_per_sector]
         if not movers and mem:
             movers = mem[:movers_per_sector]
-        zt = sum(1 for m in mem if m.is_limit_up)
+        if not movers:  # 成分股全失败 → 领涨股兜底
+            movers = _leader_as_member(b)
         enr = []
         for m in movers:
             hit = kh.lookup_score(m.code) or {}
@@ -144,7 +168,7 @@ async def build_snapshot(top_boards: int = 10, top_limit_up: int = 5,
     )
     kh_index = khunter_link.load_latest_index()
     picks = _assemble_picks(snap, kh_index)[:top_picks]
-    sector_movers = _build_sector_movers(
+    sector_movers = await _build_sector_movers(
         snap["boards_concept"], kh_index, top_sectors, movers_per_sector)
 
     tz = datetime.timezone(datetime.timedelta(hours=8))
@@ -203,9 +227,11 @@ def _mover_line(item: dict[str, Any]) -> str:
     if item.get("kh_score") is not None:
         kh_tag = f" `[KH{item['kh_score']:.0f}/#{item['kh_rank']}]`"
     flag = " 🔴涨停" if m.is_limit_up else ""
-    inflow = _fmt_yi(m.main_inflow)
-    return (f"　▸ **{m.name}** `{m.code}` {m.pct:+.2f}% "
-            f"主力{inflow}{flag}{kh_tag}")
+    # main_inflow==0 是领涨股兜底的哨兵(资金未知),不显示主力字段
+    inflow = f" 主力{_fmt_yi(m.main_inflow)}" if m.main_inflow else ""
+    lead = " _领涨_" if (not m.main_inflow and m.price == 0.0) else ""
+    return (f"　▸ **{m.name}** `{m.code}` {m.pct:+.2f}%"
+            f"{inflow}{flag}{lead}{kh_tag}")
 
 
 def _sector_block_lines(s: dict[str, Any]) -> list[str]:
