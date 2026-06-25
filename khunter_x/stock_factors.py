@@ -20,13 +20,14 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
 
-# 因子权重 — 合计 = 100,后续可做 env 配置
+# 因子权重 — 后续可做 env 配置
 FACTOR_WEIGHTS = {
     "momentum_20d": 18,       # 20 日动量
     "momentum_60d": 12,       # 60 日动量
@@ -38,6 +39,74 @@ FACTOR_WEIGHTS = {
     "today_amount_ratio": 12, # 当日活跃度
     "kh_strategy_weight": 18, # KHunter 策略权重加成
 }
+
+
+# ── Alpha Zoo 稳健因子接入(2026-06 因子回测:沪深300+中证500+中证1000+科创50,
+#    近1年 IC/IR;选「主板&宽基双 universe 都稳健、同向」的高胜率因子,权重∝IR、
+#    符号按 IC 方向)。env KHUNTER_ZOO_FACTORS=false 可关闭;算不出时优雅降级。
+ZOO_FACTORS_ENABLED = (os.environ.get("KHUNTER_ZOO_FACTORS", "true")
+                       .strip().lower() in ("1", "true", "yes", "on"))
+# {alpha_id: (权重, 中文说明)}  负权重=负IC(因子值越高、未来收益越低)
+ZOO_FACTOR_WEIGHTS = {
+    "alpha101_026":   (9,  "价量反转(IR≈.31/63%)"),
+    "qlib158_klow":   (-9, "日内低位反弹(IR≈-.29/66%胜率)"),
+    "qlib158_vsumn20": (8, "量能流向(IR≈.27)"),
+    "alpha101_041":   (7,  "价量反转-双universe稳(IR≈.24)"),
+    "alpha101_025":   (8,  "反转/量能(IR≈.26)"),
+}
+
+
+def _compute_zoo_raw(panel: dict[str, pd.DataFrame],
+                     candidate_codes: list[str]) -> dict[str, dict[str, float]]:
+    """对候选股算 Alpha Zoo 因子的最新值。
+
+    用包内因子库 src.factors.registry 计算,返回 {code: {zoo_id: raw}}。
+    任何失败(库缺失/计算异常)→ 返回 {},调用方自动退回原因子集。
+    """
+    if not ZOO_FACTORS_ENABLED:
+        return {}
+    try:
+        from src.factors.registry import get_default_registry
+    except Exception as exc:  # noqa: BLE001
+        print(f"[khunter/zoo] registry 不可用,跳过 zoo 因子: {exc}", flush=True)
+        return {}
+    try:
+        # 候选股 → 宽面板 {field: DataFrame[dates × codes]}
+        fields = ("open", "high", "low", "close", "volume", "amount")
+        sub = {c: panel[c] for c in candidate_codes
+               if c in panel and panel[c] is not None and not panel[c].empty}
+        if len(sub) < 3:
+            return {}
+        wide: dict[str, pd.DataFrame] = {}
+        for f in fields:
+            cols = {c: df[f] for c, df in sub.items() if f in df.columns}
+            if cols:
+                wide[f] = pd.concat(cols, axis=1).sort_index()
+        if "close" not in wide:
+            return {}
+        if "amount" in wide and "volume" in wide:
+            wide["vwap"] = wide["amount"] / wide["volume"].replace(0, np.nan)
+        reg = get_default_registry()
+        out: dict[str, dict[str, float]] = {c: {} for c in candidate_codes}
+        for aid in ZOO_FACTOR_WEIGHTS:
+            try:
+                fdf = reg.compute(aid, wide)
+                if fdf is None or fdf.empty:
+                    continue
+                last = fdf.iloc[-1]  # 最新一日,index=code
+                for c in candidate_codes:
+                    v = last.get(c, float("nan"))
+                    out[c][aid] = float(v) if pd.notna(v) else float("nan")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[khunter/zoo] 因子 {aid} 计算失败,跳过: {exc}", flush=True)
+                continue
+        n_ok = sum(1 for c in out for k in out[c])
+        print(f"[khunter/zoo] 接入 {len([k for k in ZOO_FACTOR_WEIGHTS])} 个 zoo 因子, "
+              f"覆盖值 {n_ok}", flush=True)
+        return out
+    except Exception as exc:  # noqa: BLE001
+        print(f"[khunter/zoo] zoo 因子整体失败,优雅降级: {exc}", flush=True)
+        return {}
 
 
 def _safe_pct_change(series: pd.Series, periods: int) -> float:
@@ -236,8 +305,18 @@ def compute_cross_sectional_scores(
         per_stock_raw[code] = compute_raw_factors_for_code(
             code, panel, kh_strategy_weight=kh_w.get(code, 0.0))
 
+    # 1b. Alpha Zoo 稳健因子(回测高胜率)— 并入 raw;失败则为空、自动退回原因子集
+    effective_weights = dict(FACTOR_WEIGHTS)
+    zoo_raw = _compute_zoo_raw(panel, candidate_codes)
+    if zoo_raw:
+        for aid, (w, _desc) in ZOO_FACTOR_WEIGHTS.items():
+            effective_weights[aid] = w
+        for code in candidate_codes:
+            for aid in ZOO_FACTOR_WEIGHTS:
+                per_stock_raw[code]["raw"][aid] = zoo_raw.get(code, {}).get(aid, float("nan"))
+
     # 2. 横截面 z-score (在候选 universe 内做)
-    factor_names = list(FACTOR_WEIGHTS.keys())
+    factor_names = list(effective_weights.keys())
     z_per_factor: dict[str, list[float]] = {}
     for f in factor_names:
         vals = [per_stock_raw[c]["raw"].get(f, float("nan")) for c in candidate_codes]
@@ -257,7 +336,7 @@ def compute_cross_sectional_scores(
         for f in factor_names:
             zv = z_per_factor[f][i]
             z[f] = zv if pd.notna(zv) else float("nan")
-            w = FACTOR_WEIGHTS[f]
+            w = effective_weights[f]
             if pd.notna(zv):
                 weighted[f] = (zv * w) / 100.0
                 total_z += weighted[f]
