@@ -193,6 +193,72 @@ def fetch_industry_boards(limit: int = 30) -> list[BoardSnapshot]:
     return _fetch_boards("m:90+t:2", limit)
 
 
+# ─────────── Board members 板块成分股 ───────────
+
+
+@dataclass(frozen=True)
+class BoardMember:
+    code: str            # 6 位代码
+    name: str
+    price: float         # 最新价
+    pct: float           # 涨跌幅 %
+    main_inflow: float   # 主力净流入 (元)
+    is_limit_up: bool    # 是否涨停(按板制近似判定)
+
+    def main_inflow_yi(self) -> float:
+        return self.main_inflow / 1e8
+
+
+def _limit_pct_for(code: str) -> float:
+    """按代码近似判断涨停幅度上限(忽略 ST 的 5%)。"""
+    c = code or ""
+    if c[:3] in ("300", "301") or c[:3] == "688":
+        return 20.0
+    if c[:2] in ("83", "87", "43", "92") or c[:3] == "920":
+        return 30.0  # 北交所
+    return 10.0
+
+
+def fetch_board_members(board_code: str, limit: int = 30,
+                        retries: int = 3) -> list[BoardMember]:
+    """板块成分股,按主力净流入降序(资金=异动信号)。
+
+    board_code: BKxxxx(仅 push2 板块榜可用;Sina 兜底源无法 drill-down)。
+    push2 不可用时抛 EastMoneyError,由调用方优雅降级(不展示板块内个股)。
+    """
+    if not board_code or not board_code.upper().startswith("BK"):
+        return []
+    params = {
+        "pn": "1", "pz": str(max(1, min(limit, 100))),
+        "po": "1", "np": "1", "fltt": "2", "invt": "2",
+        "fid": "f62",  # 主力净流入 降序
+        "fs": f"b:{board_code}",
+        "fields": "f12,f14,f2,f3,f62",
+    }
+    url = ("https://push2.eastmoney.com/api/qt/clist/get?"
+           + urllib.parse.urlencode(params))
+    d = _get_json(url, retries=retries)
+    if d.get("rc") != 0:
+        raise EastMoneyError(f"members rc={d.get('rc')} body={str(d)[:160]}")
+    rows = (d.get("data") or {}).get("diff") or []
+    out: list[BoardMember] = []
+    for r in rows:
+        try:
+            code = str(r.get("f12") or "")
+            pct = float(r.get("f3") or 0.0)
+            out.append(BoardMember(
+                code=code,
+                name=str(r.get("f14") or ""),
+                price=float(r.get("f2") or 0.0),
+                pct=pct,
+                main_inflow=float(r.get("f62") or 0.0),
+                is_limit_up=(pct >= _limit_pct_for(code) - 0.6),
+            ))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 # ─────────── Limit-up Pool 涨停股池 ───────────
 
 

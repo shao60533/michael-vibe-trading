@@ -93,12 +93,50 @@ def _assemble_picks(snap: dict[str, Any],
     return picks_lu + picks_leader
 
 
+def _build_sector_movers(boards: list[eastmoney.BoardSnapshot],
+                         kh: khunter_link.KHunterIndex,
+                         top_sectors: int,
+                         movers_per_sector: int) -> list[dict[str, Any]]:
+    """对 Top 异动板块逐个抓成分股,挑板块内异动个股(主力净流入降序)。
+
+    板块排序: 有主力净流入数据时按资金降序(异动信号),否则保留涨幅序。
+    push2 成分股不可用的板块优雅跳过(只展示板块,不展示个股)。
+    """
+    ranked = list(boards)
+    if any(b.main_inflow for b in ranked):
+        ranked = sorted(ranked, key=lambda b: b.main_inflow, reverse=True)
+
+    out: list[dict[str, Any]] = []
+    for b in ranked[:top_sectors]:
+        try:
+            mem = eastmoney.fetch_board_members(b.code, limit=30, retries=2)
+        except eastmoney.EastMoneyError as exc:
+            print(f"[intraday/em] board members {b.code} {b.name} down: {exc}",
+                  flush=True)
+            mem = []
+        movers = [m for m in mem if m.pct >= 2.0][:movers_per_sector]
+        if not movers and mem:
+            movers = mem[:movers_per_sector]
+        zt = sum(1 for m in mem if m.is_limit_up)
+        enr = []
+        for m in movers:
+            hit = kh.lookup_score(m.code) or {}
+            enr.append({"m": m, "kh_score": hit.get("score"),
+                        "kh_rank": hit.get("rank")})
+        out.append({"board": b, "movers": enr,
+                    "zt_count": zt, "member_total": len(mem)})
+    return out
+
+
 async def build_snapshot(top_boards: int = 10, top_limit_up: int = 5,
                           top_picks: int = 10,
+                          top_sectors: int = 5,
+                          movers_per_sector: int = 4,
                           with_briefing: bool = False) -> dict[str, Any]:
     """完整快照。
 
-    with_briefing 默认 False — 卡片以选股为主,LLM 板块简评是可选辅料。
+    重点已切换为**板块异动**: sector_movers = Top 异动板块 + 板块内异动个股。
+    picks(涨停/领涨个股)仍保留供 docx 用,但卡片不再以其为主线。
     """
     started = time.time()
     snap = eastmoney.fetch_snapshot(
@@ -106,6 +144,8 @@ async def build_snapshot(top_boards: int = 10, top_limit_up: int = 5,
     )
     kh_index = khunter_link.load_latest_index()
     picks = _assemble_picks(snap, kh_index)[:top_picks]
+    sector_movers = _build_sector_movers(
+        snap["boards_concept"], kh_index, top_sectors, movers_per_sector)
 
     tz = datetime.timezone(datetime.timedelta(hours=8))
     now = datetime.datetime.now(tz)
@@ -114,6 +154,7 @@ async def build_snapshot(top_boards: int = 10, top_limit_up: int = 5,
         "ts_bj": now,
         "boards_concept": snap["boards_concept"],
         "boards_error": snap.get("boards_error"),
+        "sector_movers": sector_movers,
         "limit_up_top": snap["limit_up_top"],
         "limit_up_all": snap["limit_up_all"],
         "limit_up_total": snap["limit_up_total"],
@@ -155,57 +196,99 @@ def _board_brief_line(b: eastmoney.BoardSnapshot) -> str:
     return (f"**{b.name}** {b.pct:+.2f}% 主力 {inflow} 领涨 {b.leader_name}")
 
 
+def _mover_line(item: dict[str, Any]) -> str:
+    """板块内异动个股一行。"""
+    m: eastmoney.BoardMember = item["m"]
+    kh_tag = ""
+    if item.get("kh_score") is not None:
+        kh_tag = f" `[KH{item['kh_score']:.0f}/#{item['kh_rank']}]`"
+    flag = " 🔴涨停" if m.is_limit_up else ""
+    inflow = _fmt_yi(m.main_inflow)
+    return (f"　▸ **{m.name}** `{m.code}` {m.pct:+.2f}% "
+            f"主力{inflow}{flag}{kh_tag}")
+
+
+def _sector_block_lines(s: dict[str, Any]) -> list[str]:
+    """一个异动板块 + 其板块内异动个股,多行。"""
+    b: eastmoney.BoardSnapshot = s["board"]
+    inflow = _fmt_yi(b.main_inflow)
+    zt = s.get("zt_count") or 0
+    head = f"**🔸 {b.name}** {b.pct:+.2f}% · 主力 {inflow}"
+    if zt:
+        head += f" · 涨停 {zt} 家"
+    lines = [head]
+    movers = s.get("movers") or []
+    if movers:
+        lines.extend(_mover_line(it) for it in movers)
+    else:
+        lines.append("　▸ _板块内个股数据暂不可用_")
+    return lines
+
+
 def render_feishu_card(snap: dict[str, Any],
                        title_prefix: str = "🔥 盘中异动",
                        feishu_doc_url: str | None = None,
                        notion_url: str | None = None) -> dict:
     """构造飞书 interactive card — 选股表是主段,可选挂 docx/notion 按钮。"""
     ts: datetime.datetime = snap["ts_bj"]
-    picks: list[Pick] = snap["picks"]
     boards: list[eastmoney.BoardSnapshot] = snap["boards_concept"]
+    sectors: list[dict[str, Any]] = snap.get("sector_movers") or []
     total_zt = snap["limit_up_total"]
     kh = snap["kh_index"]
 
     elements: list[dict[str, Any]] = []
 
-    # 主段: 今日异动选股 Top N
-    if picks:
-        lines = [_pick_line(i + 1, p) for i, p in enumerate(picks)]
-        n_lu = sum(1 for p in picks if p.is_limit_up)
-        n_leader = len(picks) - n_lu
+    # 主段: 异动板块 + 板块内异动个股 (板块为主线,个股为佐证)
+    if sectors:
+        blocks = []
+        for s in sectors:
+            blocks.append("\n".join(_sector_block_lines(s)))
         elements.append({
             "tag": "div",
             "text": {"tag": "lark_md",
-                      "content": (f"**🎯 今日异动选股 Top {len(picks)}** "
-                                   f"(涨停 {n_lu} · 板块领涨 {n_leader})\n"
-                                   + "\n".join(lines))},
+                      "content": (f"**🔥 异动板块 Top {len(sectors)}** "
+                                   f"(资金/涨幅领先 · 含板块内异动个股)\n\n"
+                                   + "\n\n".join(blocks))},
+        })
+    elif boards:
+        # 有板块榜但拿不到成分股(如 Sina 兜底源)→ 退化为板块速览
+        brief_lines = [f"• {_board_brief_line(b)}" for b in boards[:6]]
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md",
+                      "content": "**🔥 异动板块速览**\n" + "\n".join(brief_lines)},
+        })
+    elif snap.get("boards_error"):
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md",
+                      "content": ("**🔥 异动板块**\n"
+                                   "⚠️ 板块榜单数据源临时不可用 (EastMoney push2 "
+                                   "`clist/get` 502),涨停温度计不受影响")},
         })
     else:
         elements.append({
             "tag": "div",
             "text": {"tag": "lark_md",
-                      "content": "**🎯 今日异动选股**\n_当前没有涨停 / 异动板块_"},
+                      "content": "**🔥 异动板块**\n_当前无明显异动板块_"},
         })
 
-    # 次段: 板块速览 (1 段紧凑列表,纯 context)
-    if boards:
-        elements.append({"tag": "hr"})
-        brief_lines = [f"• {_board_brief_line(b)}" for b in boards[:5]]
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md",
-                      "content": "**📊 异动板块速览**\n" + "\n".join(brief_lines)},
-        })
-    elif snap.get("boards_error"):
-        # 板块数据源临时不可用 — 显式告知,卡片不挂(选股仍可用)
-        elements.append({"tag": "hr"})
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md",
-                      "content": ("**📊 异动板块速览**\n"
-                                   "⚠️ 板块榜单数据源临时不可用 (EastMoney push2 "
-                                   "`clist/get` 502),涨停股池 + 选股不受影响")},
-        })
+    # 次段: 涨停温度计 (纯 context,不再是主角)
+    elements.append({"tag": "hr"})
+    lu_top: list[eastmoney.LimitUpStock] = snap.get("limit_up_top") or []
+    max_boards = max((s.boards for s in snap.get("limit_up_all") or []),
+                     default=0)
+    therm = f"**🌡 涨停温度计** 全市场 {total_zt} 家涨停"
+    if max_boards >= 2:
+        therm += f" · 最高 {max_boards} 连板"
+    if lu_top:
+        names = "、".join(f"{s.name}({s.boards}板)" if s.boards >= 2 else s.name
+                          for s in lu_top[:5])
+        therm += f"\n早封强势: {names}"
+    elements.append({
+        "tag": "div",
+        "text": {"tag": "lark_md", "content": therm},
+    })
 
     # 链接按钮
     actions: list[dict] = []
