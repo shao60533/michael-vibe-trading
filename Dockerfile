@@ -5,9 +5,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# Build deps for some scientific wheels (numba/llvmlite, scipy, lxml)
+# Build deps for some scientific wheels (numba/llvmlite, scipy, lxml).
+# fonts-noto-cjk: 收盘复盘长图(Pillow)渲染中文所需字体。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential curl ca-certificates libgomp1 \
+        build-essential curl ca-certificates libgomp1 fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -21,7 +22,8 @@ RUN pip install --no-cache-dir \
     pandas \
     numpy \
     scikit-learn \
-    lightgbm
+    lightgbm \
+    Pillow
 
 # a-stock-data skill needs mootdx (TCP 7709 quote client).
 # mootdx pulls httpx[socks]<0.26 which conflicts with langgraph's newer httpx,
