@@ -15,7 +15,7 @@ WORKDIR /app
 
 # Pin to the version we tested locally.
 RUN pip install --no-cache-dir \
-    vibe-trading-ai==0.1.6 \
+    vibe-trading-ai==0.1.10 \
     uvicorn[standard] \
     python-multipart \
     stockstats \
