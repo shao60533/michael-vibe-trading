@@ -400,7 +400,7 @@ def render_recap_png(data: dict, out_path: str) -> bytes:
         ("今日笔数", f"{ts['n']}", INK, f"{data['today_date']} 选股"),
         ("平均收益", f"{_sgn(ts['avg'])}%", _col(ts["avg"]), f"中位 {_sgn(ts['med'])}%"),
         ("胜率", f"{ts['winrate']:.0f}%", INK, f"{ts['win']} 胜 / {ts['n']-ts['win']} 负"),
-        ("最佳", f"+{ts['best']['ret']:.1f}%", UP, ts["best"]["name"][:6]),
+        ("最佳", f"{ts['best']['ret']:+.1f}%", _col(ts['best']['ret']), ts["best"]["name"][:6]),
     ]
     gap = 16 * S
     kw = (cx1 - cx0 - gap * 3) // 4
@@ -491,8 +491,8 @@ def render_recap_png(data: dict, out_path: str) -> bytes:
         cards = [
             ("近7天平均", f"{_sgn(rs['avg'])}%", _col(rs["avg"])),
             ("胜率", f"{rs['winrate']:.0f}%", INK),
-            ("最佳", f"+{rs['best']['ret']:.1f}%", UP),
-            ("最差", f"{rs['worst']['ret']:.1f}%", DN),
+            ("最佳", f"{rs['best']['ret']:+.1f}%", _col(rs['best']['ret'])),
+            ("最差", f"{rs['worst']['ret']:+.1f}%", _col(rs['worst']['ret'])),
         ]
         kh2 = 120 * S
         for i, (lab, val, vc) in enumerate(cards):
@@ -543,7 +543,7 @@ def render_recap_png(data: dict, out_path: str) -> bytes:
         section_title("swarm 深度分析交叉(近7天)",
                       f"每只逐只跑投委会深度分析 · 已分类 {n_cl} 笔 · 按结论分桶")
         order = [("买入", UP), ("观望", WAIT), ("回避", DN)]
-        kh3 = 124 * S
+        kh3 = 152 * S  # 容两行底部指标,避免溢出
         kw3 = (cx1 - cx0 - gap * 2) // 3
         for i, (vk, vc) in enumerate(order):
             st = vb.get(vk) or {"n": 0}
@@ -554,13 +554,17 @@ def render_recap_png(data: dict, out_path: str) -> bytes:
             text(bx + 20 * S, y + 20 * S, f"swarm 判「{vk}」",
                  _font(23 * S, True), vc)
             if st["n"]:
-                text(bx + 20 * S, y + 52 * S, f"{_sgn(st['avg'])}%",
+                text(bx + 20 * S, y + 54 * S, f"{_sgn(st['avg'])}%",
                      _font(40 * S, True), _col(st["avg"]))
-                text(bx + 20 * S, y + 102 * S,
-                     f"{st['n']}笔 胜率{st['winrate']:.0f}% 中位{_sgn(st['med'])}%",
+                # 底部指标拆两行,避免单行溢出卡片宽度
+                text(bx + 20 * S, y + 104 * S,
+                     f"{st['n']}笔 · 胜率{st['winrate']:.0f}%",
+                     _font(20 * S, False), MUT)
+                text(bx + 20 * S, y + 128 * S,
+                     f"中位 {_sgn(st['med'])}%",
                      _font(20 * S, False), MUT)
             else:
-                text(bx + 20 * S, y + 60 * S, "—", _font(40 * S, True), MUT)
+                text(bx + 20 * S, y + 64 * S, "—", _font(40 * S, True), MUT)
         y += kh3 + 22 * S
 
         tb = data.get("today_buy") or []
