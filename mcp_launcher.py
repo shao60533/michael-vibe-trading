@@ -4837,6 +4837,73 @@ async def _do_daily_khunter_push(chat_id: str) -> None:
               f"{type(exc).__name__}: {exc}", flush=True)
 
 
+# ── A股交易日历(节假日跳过定时推送)──
+import datetime as _dt
+from pathlib import Path as _Path
+_TRADE_CAL_MEM: set | None = None
+
+
+def _bj_today_str() -> str:
+    tz = _dt.timezone(_dt.timedelta(hours=8))
+    return _dt.datetime.now(tz).strftime("%Y-%m-%d")
+
+
+def _trade_cal_path() -> _Path:
+    base = os.environ.get("STATE_DIR", "").strip() or "/tmp"
+    return _Path(base) / "trade_cal.json"
+
+
+def _fetch_trade_cal() -> set | None:
+    try:
+        import akshare as ak
+        df = ak.tool_trade_date_hist_sina()
+        dates = {str(d) for d in df["trade_date"].tolist()}
+        return dates or None
+    except Exception as exc:  # noqa: BLE001
+        print(f"[tradecal] akshare 取交易日历失败: {exc}", flush=True)
+        return None
+
+
+def _load_trade_cal() -> set | None:
+    """交易日历(内存+磁盘缓存,25天刷新一次,跨年自动补)。取不到返回 None。"""
+    global _TRADE_CAL_MEM
+    if _TRADE_CAL_MEM is not None:
+        return _TRADE_CAL_MEM
+    p = _trade_cal_path()
+    today = _bj_today_str()
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        dates = set(d.get("dates") or [])
+        fetched = d.get("fetched", "")
+        cutoff = (_dt.date.fromisoformat(today) - _dt.timedelta(days=25)).isoformat()
+        if dates and fetched >= cutoff and any(x[:4] == today[:4] for x in dates):
+            _TRADE_CAL_MEM = dates
+            return dates
+    except Exception:
+        pass
+    dates = _fetch_trade_cal()
+    if dates:
+        try:
+            p.write_text(json.dumps({"fetched": today, "dates": sorted(dates)},
+                                    ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+        _TRADE_CAL_MEM = dates
+    return dates
+
+
+def _is_a_share_trading_day(date_str: str | None = None) -> bool:
+    """今天(北京)是否 A股交易日。日历取不到时退回「工作日=交易日」(宁可推、不误跳)。"""
+    date_str = date_str or _bj_today_str()
+    cal = _load_trade_cal()
+    if not cal:
+        try:
+            return _dt.date.fromisoformat(date_str).weekday() < 5
+        except Exception:
+            return True
+    return date_str in cal
+
+
 async def _daily_khunter_scheduler() -> None:
     """工作日盘前(默认北京 08:00)推送 KHunter 日报。
 
@@ -4868,6 +4935,9 @@ async def _daily_khunter_scheduler() -> None:
         except asyncio.CancelledError:
             print("[scheduler/khunter] cancelled,exiting", flush=True)
             return
+        if not _is_a_share_trading_day():
+            print("[scheduler/khunter] 非A股交易日,跳过本次推送", flush=True)
+            continue
         try:
             await _do_daily_khunter_push(DAILY_KHUNTER_CHAT_ID)
         except Exception as exc:
@@ -4986,6 +5056,9 @@ async def _daily_khunter_recap_scheduler() -> None:
         except asyncio.CancelledError:
             print("[scheduler/recap] cancelled", flush=True)
             return
+        if not _is_a_share_trading_day():
+            print("[scheduler/recap] 非A股交易日,跳过本次推送", flush=True)
+            continue
         try:
             await _do_daily_khunter_recap_push(DAILY_RECAP_CHAT_ID)
         except Exception as exc:
@@ -5189,6 +5262,9 @@ async def _intraday_scheduler() -> None:
         except asyncio.CancelledError:
             print("[scheduler/intraday] cancelled", flush=True)
             return
+        if not _is_a_share_trading_day():
+            print("[scheduler/intraday] 非A股交易日,跳过本次推送", flush=True)
+            continue
         label = f"盘中异动 {next_run.strftime('%H:%M')}"
         try:
             await _feishu_handle_intraday_request(
