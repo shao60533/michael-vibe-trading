@@ -237,9 +237,10 @@ def _mover_line(item: dict[str, Any]) -> str:
 def _sector_block_lines(s: dict[str, Any]) -> list[str]:
     """一个异动板块 + 其板块内异动个股,多行。"""
     b: eastmoney.BoardSnapshot = s["board"]
-    inflow = _fmt_yi(b.main_inflow)
     zt = s.get("zt_count") or 0
-    head = f"**🔸 {b.name}** {b.pct:+.2f}% · 主力 {inflow}"
+    head = f"**🔸 {b.name}** {b.pct:+.2f}%"
+    if b.main_inflow:  # Sina 兜底源无主力净流入(=0)→ 不显示,避免"主力 +0万"
+        head += f" · 主力 {_fmt_yi(b.main_inflow)}"
     if zt:
         head += f" · 涨停 {zt} 家"
     lines = [head]
