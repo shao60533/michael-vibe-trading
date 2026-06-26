@@ -219,15 +219,54 @@ def _limit_pct_for(code: str) -> float:
     return 10.0
 
 
+def _fetch_board_members_sina(node_code: str, limit: int = 30) -> list[BoardMember]:
+    """Sina 板块成分股(push2 挂时兜底)。node_code 形如 gn_xxx / new_xxx
+    (来自 newFLJK)。Sina 无主力净流入 → main_inflow=0;按涨幅降序返回。
+    """
+    url = ("https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+           "Market_Center.getHQNodeData?page=1&num=" + str(max(1, min(limit, 100)))
+           + "&sort=changepercent&asc=0&node=" + urllib.parse.quote(node_code)
+           + "&symbol=")
+    req = urllib.request.Request(
+        url, headers={**_HEADERS, "Referer": "https://finance.sina.com.cn/"})
+    with urllib.request.urlopen(req, timeout=10.0) as resp:
+        body = resp.read().decode("gbk", "replace")
+    try:
+        arr = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise EastMoneyError(f"sina members parse err: {exc}") from exc
+    if not isinstance(arr, list):
+        return []
+    out: list[BoardMember] = []
+    for r in arr:
+        try:
+            sym = str(r.get("symbol") or "")
+            code = sym[2:] if sym[:2] in ("sh", "sz", "bj") else sym
+            pct = float(r.get("changepercent") or 0.0)
+            out.append(BoardMember(
+                code=code, name=str(r.get("name") or ""),
+                price=float(r.get("trade") or 0.0), pct=pct,
+                main_inflow=0.0,  # Sina 无主力净流入
+                is_limit_up=(pct >= _limit_pct_for(code) - 0.6),
+            ))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def fetch_board_members(board_code: str, limit: int = 30,
                         retries: int = 3) -> list[BoardMember]:
-    """板块成分股,按主力净流入降序(资金=异动信号)。
-
-    board_code: BKxxxx(仅 push2 板块榜可用;Sina 兜底源无法 drill-down)。
-    push2 不可用时抛 EastMoneyError,由调用方优雅降级(不展示板块内个股)。
+    """板块成分股。BKxxxx → push2(按主力净流入降序);gn_/new_(Sina 节点)
+    → Sina getHQNodeData(按涨幅降序,无主力净流入)。两源都不可用才抛错。
     """
-    if not board_code or not board_code.upper().startswith("BK"):
+    if not board_code:
         return []
+    # Sina 节点码(push2 挂时板块榜来自 Sina)
+    if not board_code.upper().startswith("BK"):
+        try:
+            return _fetch_board_members_sina(board_code, limit)
+        except Exception as exc:  # noqa: BLE001
+            raise EastMoneyError(f"sina members {board_code} err: {exc}") from exc
     params = {
         "pn": "1", "pz": str(max(1, min(limit, 100))),
         "po": "1", "np": "1", "fltt": "2", "invt": "2",
@@ -304,7 +343,7 @@ def fetch_limit_up_pool(date_str: str | None = None,
         "ut": "7eea3edcaed734bea9cbfc24409ed989",
         "dpt": "wz.ztzt",
         "Pageindex": "0",
-        "pagesize": str(max(1, min(limit, 200))),
+        "pagesize": str(max(1, min(limit, 1000))),
         "sort": "fbt:asc",
         "date": date_str,
     }
@@ -362,7 +401,8 @@ def fetch_snapshot(top_boards: int = 10, top_limit_up: int = 5,
         except EastMoneyError as exc:
             print(f"[intraday/em] industry fetch err: {exc}", flush=True)
 
-    pool = fetch_limit_up_pool(limit=max(top_limit_up * 4, 30))
+    # 拉全量(pagesize 1000)→ total_zt 反映真实全市场涨停数(原来截在30/200)
+    pool = fetch_limit_up_pool(limit=1000)
     pool_top = pool[:top_limit_up]
     total_zt = len(pool)
 
