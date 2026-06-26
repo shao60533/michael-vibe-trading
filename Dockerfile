@@ -32,6 +32,17 @@ RUN pip install --no-cache-dir \
 # Install with --no-deps and pin pytdx explicitly.
 RUN pip install --no-cache-dir --no-deps mootdx pytdx
 
+# 成本优化:investment_committee swarm 里"行情/工具获取"的两个研究员(bull/bear,
+# 工具含 get_market_data+factor_analysis、迭代最多)改用便宜的 deepseek-chat(flash);
+# 风控官 + 基金经理(纯研判)不设 model_name → 继承全局 LANGCHAIN_MODEL_NAME(pro)。
+# 就地给装好的 preset 注入 per-agent model_name(worker 原生支持 SwarmAgentSpec.model_name)。
+RUN PRESET="$(find / -path '*/src/swarm/presets/investment_committee.yaml' 2>/dev/null | head -1)" \
+    && test -n "$PRESET" \
+    && sed -i '/^  - id: bull_advocate$/a\    model_name: deepseek-chat' "$PRESET" \
+    && sed -i '/^  - id: bear_advocate$/a\    model_name: deepseek-chat' "$PRESET" \
+    && echo "=== committee per-agent model_name ===" \
+    && grep -nE "^  - id:|model_name:" "$PRESET"
+
 COPY mcp_launcher.py /app/mcp_launcher.py
 COPY factor_analysis/ /app/factor_analysis/
 COPY sequoia_x/ /app/sequoia_x/
