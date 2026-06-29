@@ -3636,6 +3636,11 @@ def _build_help_card() -> dict:
          "• `半导体板块` / `光模块怎么样` — swarm 板块轮动分析(慢,5-15 分钟)\n"
          "• `跑下行业因子量化分析` — LightGBM 行业轮动预测 + 回测(快,1-3 分钟)\n"
          "• `板块轮动 lightgbm 预测` — 同上"),
+        ("🔗 2️⃣b 产业链全栈拆解(长图)",
+         "• `拆一下固态电池产业链` / `拆解 CPO 赛道` — 指定赛道深度拆解\n"
+         "• `拆第一异动板块` / `拆第3异动板块` — 取盘中第 N 异动板块来拆\n"
+         "流程:load_skill 产业链拆解 → 单位成本主轴 → 逐层下钻 → Tier0 地基 → 多棱镜洞察 → 全栈总览,"
+         "产出长图 + 全文 docx。重活,约数分钟、硬超时 45 分钟"),
         ("🌲 3️⃣ Sequoia-X 选股",
          "• `跑下 Sequoia-X 扫描` / `红杉策略选股` — 6 策略 × 活跃 300 只 × 5 天\n"
          "• `海龟突破` / `RPS 突破` / `涨停洗盘` / `高位窄幅旗形` — 任一关键词都识别\n"
@@ -3841,6 +3846,15 @@ async def _feishu_handle_message(body: dict):
                   f"chat={chat_id} sender={sender_open_id[:12]}..", flush=True)
             await _feishu_handle_sequoia_scan(
                 chat_id, sender_open_id=sender_open_id, chat_type=chat_type)
+            return
+
+        if _is_valuechain_request(text):
+            print(f"[feishu/dispatch] value-chain teardown "
+                  f"chat={chat_id} sender={sender_open_id[:12]}..", flush=True)
+            await _feishu_handle_valuechain_request(
+                chat_id, text, sender_open_id=sender_open_id,
+                chat_type=chat_type,
+            )
             return
 
         if _is_intraday_request(text):
@@ -5229,6 +5243,216 @@ async def _feishu_handle_intraday_request(chat_id: str,
             _feishu_send_text(chat_id, chat_type, "\n".join(lines))
         except Exception as exc2:
             print(f"[intraday] fallback text err: {exc2}", flush=True)
+
+
+# ── 产业链全栈拆解 (value-chain teardown → 长图) ──
+# 触发示例:「拆一下固态电池产业链」「拆解 CPO 赛道」「拆第一异动板块」
+# 跑 value_chain_teardown_team swarm(单 agent + load_skill value-chain-teardown),
+# 解析其结构化 JSON → Pillow 长图推飞书 + 全文 docx 兜底。重活,硬超时兜底。
+VALUECHAIN_HARD_TIMEOUT = int(os.environ.get("VALUECHAIN_HARD_TIMEOUT", "2700"))
+
+_VALUECHAIN_TRIGGER = re.compile(
+    r"(?:拆解?|teardown)[^。\n]{0,8}(?:产业链|赛道)"
+    r"|产业链(?:全栈)?拆解"
+    r"|拆[^。\n]{0,6}异动板块",
+    re.I,
+)
+_VC_CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+              "1": 1, "2": 2, "3": 3, "4": 4, "5": 5}
+
+
+def _is_valuechain_request(text: str) -> bool:
+    return bool(_VALUECHAIN_TRIGGER.search(text or ""))
+
+
+def _vc_parse_request(text: str) -> tuple[str | None, int]:
+    """解析 → (显式赛道名 or None, 第N异动板块默认1)。
+
+    显式赛道名非空 → 直接拆该赛道;为 None → 取盘中第 N 异动板块。
+    """
+    t = (text or "").strip()
+    if "异动板块" in t:
+        m = re.search(r"第\s*([一二三四五12345])", t)
+        n = _VC_CN_NUM.get(m.group(1), 1) if m else 1
+        return None, n
+    # 显式赛道:拆/拆解 [一下] XXX 产业链|赛道
+    m = re.search(
+        r"(?:拆解?|teardown)\s*(?:一下|下)?\s*"
+        r"([一-龥A-Za-z0-9\+/\-]+?)\s*(?:产业链|赛道)",
+        t, re.I)
+    if m and m.group(1):
+        return m.group(1).strip(), 1
+    m = re.search(r"产业链(?:全栈)?拆解\s*"
+                  r"([一-龥A-Za-z0-9\+/\-]+)", t)
+    if m and m.group(1):
+        return m.group(1).strip(), 1
+    return None, 1
+
+
+def _vc_extract_json(report_md: str) -> dict | None:
+    """从 agent 产出里抽取结构化 JSON(优先 ```json 围栏,退化到首个平衡花括号)。"""
+    if not report_md:
+        return None
+    blob = None
+    m = re.search(r"```json\s*(\{.*?\})\s*```", report_md, re.S)
+    if m:
+        blob = m.group(1)
+    else:
+        m = re.search(r"(\{.*\})", report_md, re.S)
+        blob = m.group(1) if m else None
+    if not blob:
+        return None
+    for cand in (blob, blob[:blob.rfind("}") + 1]):
+        try:
+            obj = json.loads(cand)
+            if isinstance(obj, dict) and obj.get("sector"):
+                return obj
+        except Exception:
+            continue
+    return None
+
+
+async def _feishu_handle_valuechain_request(chat_id: str, text: str,
+                                            sender_open_id: str = "",
+                                            chat_type: str = "") -> None:
+    """产业链全栈拆解 → 长图。手动指令触发的重任务。"""
+    sector, n = _vc_parse_request(text)
+
+    # 赛道来源:显式名 or 盘中第 N 异动板块
+    if not sector:
+        try:
+            from intraday import service as intraday_svc
+            snap = await asyncio.wait_for(
+                intraday_svc.build_snapshot(top_boards=20, top_picks=10,
+                                            top_sectors=5, movers_per_sector=4),
+                timeout=45,
+            )
+            sectors = snap.get("sector_movers") or []
+            if not sectors:
+                _feishu_send_text(chat_id, "chat_id",
+                                  "❌ 当前没抓到异动板块,无法拆解。可改用「拆一下 XX 产业链」直接指定赛道。")
+                return
+            idx = min(max(n, 1), len(sectors)) - 1
+            board = sectors[idx]["board"]
+            sector = board.name
+            _feishu_send_text(
+                chat_id, "chat_id",
+                f"📍 取第 {idx + 1} 异动板块:{sector}（{board.pct:+.2f}%）")
+        except Exception as exc:
+            _feishu_send_text(chat_id, "chat_id",
+                              f"❌ 取异动板块失败:{type(exc).__name__}: {exc}")
+            return
+
+    _feishu_send_text(
+        chat_id, "chat_id",
+        f"🔗 开始「{sector}」产业链全栈拆解\n"
+        "(单位成本主轴 → 逐层下钻 → Tier0 地基 → 多棱镜洞察 → 全栈总览)\n"
+        f"调用 value-chain-teardown skill 深度跑,约数分钟、硬超时 "
+        f"{VALUECHAIN_HARD_TIMEOUT // 60} 分钟,完成后推回长图 + 全文文档。")
+
+    # 跑 swarm
+    try:
+        from src.swarm.runtime import SwarmRuntime
+        from src.swarm.store import SwarmStore
+        from src.swarm.models import RunStatus
+        swarm_dir = mcp_server.AGENT_DIR / ".swarm" / "runs"
+        store = SwarmStore(base_dir=swarm_dir)
+        runtime = SwarmRuntime(store=store)
+        variables = {"target": sector, "market": "CN",
+                     "goal": f"{sector} 产业链全栈拆解"}
+        run = await asyncio.to_thread(
+            runtime.start_run, "value_chain_teardown_team", variables)
+        run_id = run.id
+        print(f"[valuechain] started run={run_id} sector={sector}", flush=True)
+    except Exception as exc:
+        _feishu_send_text(chat_id, "chat_id",
+                          f"❌ 启动拆解 swarm 失败:{type(exc).__name__}: {exc}")
+        return
+
+    # 轮询直到终态 / 硬超时
+    deadline = time.time() + VALUECHAIN_HARD_TIMEOUT
+    final = None
+    while time.time() < deadline:
+        await asyncio.sleep(15)
+        try:
+            r = await asyncio.to_thread(store.load_run, run_id)
+        except Exception as e:
+            print(f"[valuechain] load_run err: {e}", flush=True)
+            continue
+        if r and r.status in (RunStatus.completed, RunStatus.failed,
+                              RunStatus.cancelled):
+            final = r
+            break
+    if final is None:
+        _feishu_send_text(chat_id, "chat_id",
+                          f"⏱ 「{sector}」拆解超过 {VALUECHAIN_HARD_TIMEOUT // 60} "
+                          f"分钟硬超时,已放弃。run_id: {run_id}")
+        return
+
+    report = (getattr(final, "final_report", None) or "").strip()
+    if final.status != RunStatus.completed or not report:
+        _feishu_send_text(
+            chat_id, "chat_id",
+            f"❌ 「{sector}」拆解未完成(status={final.status.value})。"
+            f"run_id: {run_id}")
+        return
+
+    # 解析结构化 JSON → 渲染长图
+    data = _vc_extract_json(report)
+    ts = time.strftime("%Y-%m-%d %H:%M 北京")
+    img_sent = False
+    if data:
+        data.setdefault("sector", sector)
+        data["as_of"] = ts
+        try:
+            from khunter_x.value_chain_longimg import render_valuechain_png
+            out_dir = mcp_server.AGENT_DIR / "uploads"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = str(out_dir / f"valuechain-{run_id}.png")
+            png = await asyncio.to_thread(render_valuechain_png, data, out_path)
+            key = await asyncio.to_thread(_feishu_upload_image, png)
+            if key:
+                _feishu_send_image(chat_id, "chat_id", key)
+                img_sent = True
+                print(f"[valuechain] image sent run={run_id} "
+                      f"bytes={len(png)}", flush=True)
+        except Exception as exc:
+            print(f"[valuechain] render/send img err: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+    else:
+        print(f"[valuechain] no structured JSON parsed run={run_id}",
+              flush=True)
+
+    # 全文 docx(best-effort)+ 链接;若长图没出,退化为长文本
+    feishu_doc_url = None
+    try:
+        summary = {"title": f"{sector} 产业链全栈拆解", "badge": "产业链拆解",
+                   "kv_fields": [{"label": "赛道", "value": sector},
+                                 {"label": "时点", "value": ts}],
+                   "headline": f"{sector} 产业链全栈拆解",
+                   "short_tldr": (data.get("summary") if data else "")
+                   or "结构化拆解详见长图,全文见文档。",
+                   "youzi_views": []}
+        feishu_doc_url = await asyncio.to_thread(
+            _feishu_create_doc_from_report, summary, report, run_id,
+            "value_chain_teardown", sender_open_id)
+    except Exception as exc:
+        print(f"[valuechain] docx err: {type(exc).__name__}: {exc}",
+              flush=True)
+
+    if img_sent:
+        if feishu_doc_url:
+            _feishu_send_text(chat_id, "chat_id",
+                              f"📄 「{sector}」全文拆解文档:{feishu_doc_url}")
+    else:
+        # 长图失败兜底:发文档链接,再不行发长文本
+        if feishu_doc_url:
+            _feishu_send_text(
+                chat_id, "chat_id",
+                f"⚠️ 长图渲染未成功,「{sector}」拆解全文见文档:{feishu_doc_url}")
+        else:
+            _feishu_send_long(chat_id, "chat_id",
+                              f"# {sector} 产业链全栈拆解\n\n{report}")
 
 
 async def _intraday_scheduler() -> None:

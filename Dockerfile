@@ -54,6 +54,19 @@ COPY intraday/ /app/intraday/
 # skills dir so SkillsLoader picks them up regardless of runtime user / HOME.
 COPY skills/ /tmp/extra_skills/
 
+# Add-on swarm presets (e.g., value_chain_teardown_team). Presets load ONLY from
+# the package's src/swarm/presets dir (no custom path), so copy ours in there.
+COPY swarm_presets/ /tmp/extra_presets/
+RUN PRESETS_DIR="$(python -c "from src.swarm.presets import PRESETS_DIR; print(PRESETS_DIR)")" \
+    && echo "swarm presets dir = $PRESETS_DIR" \
+    && cp /tmp/extra_presets/*.yaml "$PRESETS_DIR/" \
+    && for f in /tmp/extra_presets/*.yaml; do \
+         n=$(basename "$f" .yaml); \
+         python -c "from src.swarm.presets import load_preset; load_preset('$n')" \
+           || { echo "PRESET LOAD FAILED: $n"; exit 1; }; \
+         echo "✓ preset installed: $n"; \
+       done
+
 # Non-root setup + skill installation + writable state dirs.
 RUN useradd --create-home --shell /usr/sbin/nologin vibe \
     && mkdir -p /app/runs /app/sessions \

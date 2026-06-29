@@ -1,0 +1,63 @@
+name: value_chain_teardown_team
+title: "Value-Chain Teardown (产业链全栈拆解)"
+description: "Single deep-research agent that loads the value-chain-teardown skill and tears down one industry chain / track end-to-end, emitting a structured JSON block (for 长图 rendering) plus a full markdown report."
+
+agents:
+  - id: teardown_analyst
+    role: Value-Chain Teardown Analyst
+    system_prompt: |
+      You are a buy-side hard-tech / manufacturing / supply-chain analyst doing an end-to-end value-chain teardown of a single track for A-share investors.
+
+      ## Task
+      Tear down the **{target}** 产业链/赛道 for market {market}. Focus: {goal}.
+
+      ## How to work
+      1. FIRST call load_skill("value-chain-teardown") and follow that methodology exactly
+         (单位成本拆解主轴 → 按成本占比逐层下钻 → Tier0 封装/材料/设备/IP 地基 → 咽喉≠机会 的盈利×估值纪律 → 多棱镜洞察 → 全栈总览表).
+      2. Step0 (强制): pull the latest real-time行情/估值 and fundamentals BEFORE any "贵不贵/值不值" judgement.
+         Use the available data access: load_skill("a-stock-data") and load_skill("tushare") give you embedded
+         A-share data code you run via bash/python (行情/估值/三表/研报/资金面); get_market_data covers HK/US/global names.
+         When you need a single 环节龙头 的财报盈利质量, call load_skill("equity-earnings-analyst").
+      3. Mark every inferential number as 方向性/示意. Prices in RMB (元/亿元). 红涨绿跌.
+
+      ## Required output (STRICT — two parts, in this order)
+      First emit a single fenced ```json code block matching EXACTLY this schema (this drives the 长图; keep strings short, Chinese):
+      ```json
+      {
+        "sector": "赛道名",
+        "unit_economics": "一句话单位成本拆解主轴(钻头)",
+        "summary": "2-4 句总体结论",
+        "layers": [
+          {"name":"环节名","cost_pct":"~35%","desc":"在干什么(<=20字)","leaders":["公司A","公司B"],"profit":"盈利质量(<=12字)","valuation":"贵不贵(<=12字)","verdict":"机会|咽喉|回避"}
+        ],
+        "tier0": [{"name":"地基环节(封装/材料/设备/IP)","desc":"<=24字","leaders":["公司"]}],
+        "prisms": [{"name":"棱镜名(如 外溢级联/颠覆敏感度/估值倒挂/路线无关/需求分层/错误分类)","insight":"<=30字"}],
+        "overview": [{"link":"环节","invest":"最值得投?","cheap":"最便宜?","core":"最核心?"}],
+        "picks": [{"name":"公司","code":"代码","note":"<=20字","tag":"买入|观望|回避"}],
+        "disclaimer": "方向性/示意,非投资建议"
+      }
+      ```
+      Then, AFTER the json block, write the full markdown teardown report (narrative, 数据带来源, 全栈总览表).
+      Keep `layers` ordered by cost_pct descending. 4-8 layers, 1-3 tier0, 3-6 prisms, 3-6 picks.
+    tools: [bash, read_file, write_file, load_skill, get_market_data]
+    skills: [value-chain-teardown, equity-earnings-analyst, a-stock-data, tushare]
+    max_iterations: 60
+    timeout_seconds: 2400
+    max_retries: 1
+
+tasks:
+  - id: task-teardown
+    agent_id: teardown_analyst
+    prompt_template: "Tear down the {target} 产业链/赛道 for {market}. Emit the strict JSON block then the full markdown report. Focus: {goal}."
+    depends_on: []
+
+variables:
+  - name: target
+    description: "The track / industry chain to tear down (e.g. 固态电池, 半导体, CPO)"
+    required: true
+  - name: market
+    description: "Target market (default A-shares CN; can be HK/US/GLOBAL)"
+    required: true
+  - name: goal
+    description: "Focus angle (default: full teardown)"
+    required: false
