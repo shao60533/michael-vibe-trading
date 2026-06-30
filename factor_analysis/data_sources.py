@@ -263,10 +263,27 @@ def fetch_industry_panel(
 
 
 def fetch_sina_daily_kline(symbol: str, datalen: int = 400) -> list[dict[str, Any]]:
-    """Fetch A-share daily kline from Sina for a stock or ETF symbol.
+    """A 股日K(不复权)。**Tushare 优先,Sina 兜底**。
 
-    `symbol` uses Sina notation, for example `sh512480` or `sz159995`.
+    名字保留为 `fetch_sina_daily_kline` 以兼容所有调用方(KHunter / Sequoia /
+    factor 都 import 它)。配了 `TUSHARE_TOKEN` 时走 Tushare Pro(更稳、不被封 IP);
+    未配或 Tushare 失败/空 → 回退到原 Sina 接口。返回 row 结构两路一致。
+
+    `symbol` 用 Sina 记法,例如 `sh512480` / `sz159995` / `sh600519`。
     """
+    try:
+        from . import tushare_client
+        if tushare_client.enabled():
+            rows = tushare_client.daily_kline(symbol, datalen=datalen)
+            if rows:
+                return rows
+    except Exception:
+        pass  # 任何异常都回退到 Sina,绝不因 Tushare 故障而中断
+    return _fetch_sina_daily_kline_raw(symbol, datalen=datalen)
+
+
+def _fetch_sina_daily_kline_raw(symbol: str, datalen: int = 400) -> list[dict[str, Any]]:
+    """原 Sina 实现(兜底)。`symbol` 用 Sina 记法,如 `sh512480` / `sz159995`。"""
     params = {"symbol": symbol, "scale": "240", "ma": "no", "datalen": str(datalen)}
     try:
         data = _get_json(
