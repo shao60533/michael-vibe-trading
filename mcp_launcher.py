@@ -5360,8 +5360,11 @@ async def _feishu_handle_valuechain_request(chat_id: str, text: str,
         runtime = SwarmRuntime(store=store)
         variables = {"target": sector, "market": "CN",
                      "goal": f"{sector} 产业链全栈拆解"}
+        # include_shell_tools=True: 拆解 agent 需要 bash 跑 tushare / a-stock-data
+        # skill 的取数代码(否则 build_swarm_registry 会丢弃 bash,拉不到真实数据)。
         run = await asyncio.to_thread(
-            runtime.start_run, "value_chain_teardown_team", variables)
+            runtime.start_run, "value_chain_teardown_team", variables,
+            include_shell_tools=True)
         run_id = run.id
         print(f"[valuechain] started run={run_id} sector={sector}", flush=True)
     except Exception as exc:
