@@ -40,8 +40,11 @@ RUN PRESET="$(find / -path '*/src/swarm/presets/investment_committee.yaml' 2>/de
     && test -n "$PRESET" \
     && sed -i '/^  - id: bull_advocate$/a\    model_name: deepseek-chat' "$PRESET" \
     && sed -i '/^  - id: bear_advocate$/a\    model_name: deepseek-chat' "$PRESET" \
-    && echo "=== committee per-agent model_name ===" \
-    && grep -nE "^  - id:|model_name:" "$PRESET"
+    # 决策 agent portfolio_manager 去掉 backtest → 变纯综合角色(仅通用工具),
+    # 否则被判 data-agent、只输出文本决策会触发 "no tool evidence" 契约失败(task-decision failed)。
+    && sed -i 's/    tools: \[bash, read_file, write_file, load_skill, backtest\]/    tools: [bash, read_file, write_file, load_skill]/' "$PRESET" \
+    && echo "=== committee per-agent model_name + decision tools ===" \
+    && grep -nE "^  - id:|model_name:|backtest" "$PRESET"
 
 COPY mcp_launcher.py /app/mcp_launcher.py
 COPY factor_analysis/ /app/factor_analysis/
