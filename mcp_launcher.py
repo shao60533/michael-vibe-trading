@@ -5252,7 +5252,7 @@ async def _feishu_handle_intraday_request(chat_id: str,
 VALUECHAIN_HARD_TIMEOUT = int(os.environ.get("VALUECHAIN_HARD_TIMEOUT", "2700"))
 
 _VALUECHAIN_TRIGGER = re.compile(
-    r"(?:拆解?|teardown)[^。\n]{0,8}(?:产业链|赛道)"
+    r"(?:拆解?|teardown)[^。\n]{0,8}(?:产业链|赛道|行业)"
     r"|产业链(?:全栈)?拆解"
     r"|拆[^。\n]{0,6}异动板块",
     re.I,
@@ -5275,10 +5275,10 @@ def _vc_parse_request(text: str) -> tuple[str | None, int]:
         m = re.search(r"第\s*([一二三四五12345])", t)
         n = _VC_CN_NUM.get(m.group(1), 1) if m else 1
         return None, n
-    # 显式赛道:拆/拆解 [一下] XXX 产业链|赛道
+    # 显式赛道:拆/拆解 [一下] XXX 产业链|赛道|行业
     m = re.search(
         r"(?:拆解?|teardown)\s*(?:一下|下)?\s*"
-        r"([一-龥A-Za-z0-9\+/\-]+?)\s*(?:产业链|赛道)",
+        r"([一-龥A-Za-z0-9\+/\-]+?)\s*(?:产业链|赛道|行业)",
         t, re.I)
     if m and m.group(1):
         return m.group(1).strip(), 1
