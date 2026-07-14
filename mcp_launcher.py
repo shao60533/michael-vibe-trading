@@ -3494,6 +3494,14 @@ def _feishu_poll_loop():
                             print(f"[feishu] publish err {run_id}: {e}", flush=True)
                         with _feishu_pending_lock:
                             _feishu_pending.pop(run_id, None)
+                        # 与内存 pop 同语义地删除盘上 feishu_meta:发布只尝试一次,
+                        # 不删的话每次重启 _restore_feishu_pending_from_disk 会把
+                        # 终态 run 捞回来重新发布 → 群里重复推送。
+                        try:
+                            _feishu_meta_path(run_id).unlink(missing_ok=True)
+                        except Exception as e:
+                            print(f"[feishu] meta cleanup err {run_id}: {e}",
+                                  flush=True)
                 time.sleep(15)
             except Exception as e:
                 print(f"[feishu] poll loop error: {e}", file=sys.stderr, flush=True)
