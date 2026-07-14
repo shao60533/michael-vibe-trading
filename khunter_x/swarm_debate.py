@@ -90,7 +90,8 @@ async def run_swarm_debates_for_top(
                          f"行业景气/公告/估值/事件/风险共 8 个维度,"
                          f"输出多方/空方/分歧/共识/次日验证"),
             }
-            run = runtime.start_run("investment_committee", variables)
+            run = runtime.start_run("investment_committee", variables,
+                                    include_shell_tools=True)
             result["run_id"] = run.id
 
             # 异步 poll 直到 terminal 或超时

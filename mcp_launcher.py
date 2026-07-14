@@ -938,7 +938,10 @@ def start_swarm_async(preset_name: str, variables: dict[str, str]) -> str:
     store = SwarmStore(base_dir=swarm_dir)
     runtime = SwarmRuntime(store=store)
     try:
-        run = runtime.start_run(preset_name, variables)
+        # include_shell_tools=True: 数据类 agent 需要 bash 跑 tushare / a-stock-data
+        # skill 的取数代码,否则 registry 会丢弃 bash,agent 只能退化到 read_url。
+        run = runtime.start_run(preset_name, variables,
+                                include_shell_tools=True)
     except FileNotFoundError as exc:
         return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
     except ValueError as exc:
@@ -4076,7 +4079,10 @@ async def _fire_swarm(chat_id: str, preset: str, target: str | None,
     runtime = SwarmRuntime(store=store)
     variables = _build_preset_vars(preset, target, market, raw_text)
     try:
-        run = runtime.start_run(preset, variables)
+        # include_shell_tools=True: 同 run_swarm/拆解链 — bash 是 tushare /
+        # a-stock-data 等取数 skill 的执行载体,不开等于没有数据源。
+        run = runtime.start_run(preset, variables,
+                                include_shell_tools=True)
     except FileNotFoundError as e:
         _feishu_send_text(chat_id, "chat_id",
                           f"preset '{preset}' 不存在。发 presets 看完整列表。\n详细: {e}")

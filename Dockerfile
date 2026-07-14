@@ -46,6 +46,19 @@ RUN PRESET="$(find / -path '*/src/swarm/presets/investment_committee.yaml' 2>/de
     && echo "=== committee per-agent model_name + decision tools ===" \
     && grep -nE "^  - id:|model_name:|backtest" "$PRESET"
 
+# A股数据技能进白名单:skills 白名单决定 agent「看得见」哪些 skill 描述,
+# 不在名单里模型就不会 load。默认名单挂的 yfinance 在境内(Yahoo 拉黑云段)取不到数,
+# 给多空双方 / 财报 desk 补 tushare + a-stock-data(读 TUSHARE_TOKEN,境内直连)。
+RUN IC="$(find / -path '*/src/swarm/presets/investment_committee.yaml' 2>/dev/null | head -1)" \
+    && ERD="$(find / -path '*/src/swarm/presets/earnings_research_desk.yaml' 2>/dev/null | head -1)" \
+    && test -n "$IC" && test -n "$ERD" \
+    && sed -i 's/skills: \[technical-basic, fundamental-filter, yfinance, earnings-revision, sentiment-analysis\]/skills: [technical-basic, fundamental-filter, yfinance, earnings-revision, sentiment-analysis, tushare, a-stock-data]/' "$IC" \
+    && sed -i 's/skills: \[technical-basic, fundamental-filter, yfinance, risk-analysis, volatility\]/skills: [technical-basic, fundamental-filter, yfinance, risk-analysis, volatility, tushare, a-stock-data]/' "$IC" \
+    && sed -i 's/skills: \[edgar-sec-filings, financial-statement, yfinance, fundamental-filter, valuation-model\]/skills: [edgar-sec-filings, financial-statement, yfinance, fundamental-filter, valuation-model, tushare, a-stock-data]/' "$ERD" \
+    && sed -i 's/skills: \[earnings-revision, earnings-forecast\]/skills: [earnings-revision, earnings-forecast, tushare, a-stock-data]/' "$ERD" \
+    && echo "=== data-skill whitelists ===" \
+    && grep -n "tushare, a-stock-data" "$IC" "$ERD"
+
 COPY mcp_launcher.py /app/mcp_launcher.py
 COPY factor_analysis/ /app/factor_analysis/
 COPY sequoia_x/ /app/sequoia_x/
